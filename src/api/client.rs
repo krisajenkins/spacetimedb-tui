@@ -184,23 +184,7 @@ impl SpacetimeClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            let body_snip: String = body.chars().take(200).collect();
-            if status.as_u16() == 500 {
-                bail!(
-                    "Schema HTTP 500 for '{database}'. The server could not \
-                     serialise its schema — usually this means the database \
-                     was published with a module format this client doesn't \
-                     understand, or the module crashed on the server side. \
-                     Server body: {body_snip}"
-                );
-            }
-            if status.as_u16() == 404 {
-                bail!(
-                    "Schema HTTP 404 — database '{database}' does not exist \
-                     or is not visible to the current identity"
-                );
-            }
-            bail!("Schema HTTP {status}: {body_snip}");
+            bail!(schema_error_message(database, status.as_u16(), &body));
         }
 
         let raw: Value = resp
@@ -646,6 +630,39 @@ fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
     }
 
     Some(result)
+}
+
+/// Build a human-readable error for a non-success `GET /schema` response.
+///
+/// Kept as a pure function (status code + body in, message out) so the
+/// classification can be unit-tested without standing up an HTTP server.
+fn schema_error_message(database: &str, status: u16, body: &str) -> String {
+    let body_snip: String = body.chars().take(200).collect();
+    match status {
+        500 => format!(
+            "Schema HTTP 500 for '{database}'. The server could not \
+             serialise its schema — usually this means the database \
+             was published with a module format this client doesn't \
+             understand, or the module crashed on the server side. \
+             Server body: {body_snip}"
+        ),
+        404 => format!(
+            "Schema HTTP 404 — database '{database}' does not exist \
+             or is not visible to the current identity"
+        ),
+        // Maincloud suspends inactive databases. Every endpoint
+        // (schema, SQL, even the WebSocket subscribe upgrade) then
+        // returns `503 database is paused`. This is server-side state,
+        // not a protocol/version mismatch, and the client cannot resume
+        // it — the database must be woken from the SpacetimeDB dashboard
+        // (or by republishing it).
+        503 if body.to_lowercase().contains("paused") => format!(
+            "Database '{database}' is paused. SpacetimeDB Maincloud \
+             suspends inactive databases; resume it from the dashboard \
+             at https://spacetimedb.com (or republish it), then reconnect."
+        ),
+        _ => format!("Schema HTTP {status}: {body_snip}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,5 +1361,58 @@ mod tests {
         let types: Vec<Value> = vec![];
         let cols = resolve_columns(&types, 99);
         assert!(cols.is_empty());
+    }
+
+    // ── Schema error classification ─────────────────────────────────────
+
+    #[test]
+    fn schema_error_503_paused_is_actionable() {
+        // Maincloud returns `503 database is paused` for suspended
+        // databases. The message must name the database, say it's
+        // paused, and tell the user how to resume — not leak the raw
+        // "Schema HTTP 503 Service Unavailable" body.
+        let msg = schema_error_message("space-dungeon", 503, "database is paused");
+        assert!(msg.contains("space-dungeon"));
+        assert!(msg.to_lowercase().contains("paused"));
+        assert!(msg.contains("dashboard"));
+        assert!(!msg.contains("Schema HTTP 503"));
+    }
+
+    #[test]
+    fn schema_error_503_paused_case_insensitive() {
+        // Body casing varies; the paused branch must still match.
+        let msg = schema_error_message("db", 503, "Database Is Paused");
+        assert!(msg.to_lowercase().contains("paused"));
+        assert!(msg.contains("dashboard"));
+    }
+
+    #[test]
+    fn schema_error_503_without_paused_falls_through() {
+        // A 503 that isn't a pause (e.g. genuine outage) keeps the
+        // generic message so we don't mislabel it.
+        let msg = schema_error_message("db", 503, "upstream timeout");
+        assert!(msg.contains("Schema HTTP 503"));
+        assert!(msg.contains("upstream timeout"));
+    }
+
+    #[test]
+    fn schema_error_404_and_500_messages() {
+        let m404 = schema_error_message("db", 404, "");
+        assert!(m404.contains("404"));
+        assert!(m404.contains("does not exist"));
+
+        let m500 = schema_error_message("db", 500, "boom");
+        assert!(m500.contains("500"));
+        assert!(m500.contains("boom"));
+    }
+
+    #[test]
+    fn schema_error_body_is_truncated() {
+        // Generic branch caps the server body at 200 chars so a huge
+        // response can't blow up the error line.
+        let long = "x".repeat(500);
+        let msg = schema_error_message("db", 502, &long);
+        assert!(msg.contains("Schema HTTP 502"));
+        assert!(msg.matches('x').count() <= 200);
     }
 }
