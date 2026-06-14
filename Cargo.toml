@@ -41,6 +41,9 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# Identity derivation from OIDC JWT claims (SpacetimeDB maincloud tokens)
+blake3 = "1"
+
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
 

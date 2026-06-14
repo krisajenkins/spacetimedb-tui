@@ -4,8 +4,8 @@
 //! for every endpoint used by the TUI.  All methods are `async` and return
 //! `anyhow::Result<T>` so that callers can use the `?` operator freely.
 
-use anyhow::{anyhow, bail, Context, Result};
-use reqwest::{header, Client};
+use anyhow::{Context, Result, anyhow, bail};
+use reqwest::{Client, header};
 use serde_json::Value;
 use tracing::{debug, instrument, warn};
 
@@ -551,7 +551,52 @@ pub fn extract_identity_from_jwt(token: &str) -> Option<String> {
     let payload_b64 = parts.next()?;
     let payload_bytes = base64url_decode(payload_b64)?;
     let json: Value = serde_json::from_slice(&payload_bytes).ok()?;
-    json.get("hex_identity")?.as_str().map(String::from)
+
+    // Legacy self-hosted SpacetimeDB tokens embed the hex identity directly.
+    if let Some(hex) = json.get("hex_identity").and_then(Value::as_str) {
+        return Some(hex.to_string());
+    }
+
+    // OIDC tokens (e.g. SpacetimeDB maincloud, issued by auth.spacetimedb.com)
+    // carry the standard `iss`/`sub` claims instead; the identity is derived
+    // from them.
+    let issuer = json.get("iss").and_then(Value::as_str)?;
+    let subject = json.get("sub").and_then(Value::as_str)?;
+    Some(identity_from_claims(issuer, subject))
+}
+
+/// Derive a SpacetimeDB identity (64-char hex string) from a token's issuer
+/// and subject claims, matching SpacetimeDB's `Identity::from_claims`:
+///
+/// 1. `id_hash  = blake3("{issuer}|{subject}")[..26]`
+/// 2. `checksum = blake3([0xc2, 0x00] ++ id_hash)[..4]`
+/// 3. `identity = [0xc2, 0x00] ++ checksum ++ id_hash`  (32 bytes, big-endian)
+///
+/// The leading `0xc2, 0x00` bytes are why every identity renders with a
+/// `c200` prefix.
+fn identity_from_claims(issuer: &str, subject: &str) -> String {
+    let input = format!("{issuer}|{subject}");
+    let id_hash = blake3::hash(input.as_bytes());
+    let id_hash = &id_hash.as_bytes()[..26];
+
+    let mut checksum_input = [0u8; 28];
+    checksum_input[0] = 0xc2;
+    checksum_input[1] = 0x00;
+    checksum_input[2..].copy_from_slice(id_hash);
+    let checksum = blake3::hash(&checksum_input);
+
+    let mut bytes = [0u8; 32];
+    bytes[0] = 0xc2;
+    bytes[1] = 0x00;
+    bytes[2..6].copy_from_slice(&checksum.as_bytes()[..4]);
+    bytes[6..].copy_from_slice(id_hash);
+
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// Decode a base64url-encoded string (no padding required) into raw bytes.
@@ -1016,6 +1061,53 @@ fn extract_database_names(raw: Value) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // JWT payloads below are base64url(JSON) with throwaway header/signature.
+    // The OIDC payload decodes to:
+    //   {"iss":"https://auth.spacetimedb.com","sub":"test-subject-0001"}
+    const OIDC_PAYLOAD: &str =
+        "eyJpc3MiOiJodHRwczovL2F1dGguc3BhY2V0aW1lZGIuY29tIiwic3ViIjoidGVzdC1zdWJqZWN0LTAwMDEifQ";
+    // {"hex_identity":"deadbeef"}
+    const LEGACY_PAYLOAD: &str = "eyJoZXhfaWRlbnRpdHkiOiJkZWFkYmVlZiJ9";
+    // Golden identity for the OIDC payload. Cross-checked against the real
+    // identity that `spacetime login show` reports for a maincloud token, so
+    // this pins the exact SpacetimeDB `from_claims` derivation.
+    const OIDC_GOLDEN: &str = "c2005855e0ffa65fe854d934cff22cd1c9c60c2070d562b65f07f2c5f20dd8c1";
+
+    #[test]
+    fn identity_from_claims_matches_golden() {
+        let id = identity_from_claims("https://auth.spacetimedb.com", "test-subject-0001");
+        assert_eq!(id, OIDC_GOLDEN);
+        // Every SpacetimeDB identity renders with the c200 prefix and is 32
+        // bytes (64 hex chars).
+        assert!(id.starts_with("c200"));
+        assert_eq!(id.len(), 64);
+    }
+
+    #[test]
+    fn extract_identity_derives_from_oidc_claims() {
+        let token = format!("hdr.{OIDC_PAYLOAD}.sig");
+        assert_eq!(
+            extract_identity_from_jwt(&token).as_deref(),
+            Some(OIDC_GOLDEN)
+        );
+    }
+
+    #[test]
+    fn extract_identity_prefers_legacy_hex_identity() {
+        // When the legacy claim is present it wins, no derivation needed.
+        let token = format!("hdr.{LEGACY_PAYLOAD}.sig");
+        assert_eq!(
+            extract_identity_from_jwt(&token).as_deref(),
+            Some("deadbeef")
+        );
+    }
+
+    #[test]
+    fn extract_identity_none_for_garbage() {
+        assert!(extract_identity_from_jwt("not-a-jwt").is_none());
+        assert!(extract_identity_from_jwt("hdr.@@@.sig").is_none());
+    }
 
     #[test]
     fn test_parse_query_result_array_wrapper() {
