@@ -59,8 +59,12 @@ pub enum AppEvent {
     },
     /// Table-browse result arrived (triggered by selecting a table from the
     /// sidebar). Kept separate from `QueryResult` so the Tables tab and the
-    /// SQL tab do not share state.
+    /// SQL tab do not share state. Carries the `database`/`table` it was
+    /// fetched for so the handler can cache it under the right key and
+    /// ignore a stale result if the user has since moved on.
     TableBrowseResult {
+        database: String,
+        table: String,
         result: crate::api::types::QueryResult,
     },
     /// Table-browse load failed.
@@ -128,12 +132,21 @@ pub struct App {
     /// Last time the Live tab polled `st_client` for the connected-client
     /// list. Throttled the same way metrics are.
     last_live_clients_fetch: Option<Instant>,
+    /// When the sidebar table selection last changed via cycling. Set on
+    /// each `j`/`k` step and cleared once the debounce window elapses and
+    /// we load the table's data — so holding the key down doesn't fire a
+    /// query per keystroke.
+    pending_table_load: Option<Instant>,
 }
 
 /// How often the Metrics tab automatically refreshes server-side metrics.
 const METRICS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// How often the Live tab re-polls `st_client` for connected clients.
 const LIVE_CLIENTS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// How long the sidebar table selection must stay put before we auto-load
+/// its data. Debounces `j`/`k` cycling so a quick scroll through the list
+/// only queries the table the user actually lands on.
+const TABLE_LOAD_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Maximum time we wait for any single HTTP-backed background request before
 /// surfacing a timeout error to the user.
@@ -166,6 +179,7 @@ impl App {
             auth_token: config.auth_token.clone(),
             last_metrics_fetch: None,
             last_live_clients_fetch: None,
+            pending_table_load: None,
             user_config: config.user_config.clone(),
             pending_session: if config.user_config.restore_session {
                 Some(crate::user_config::SessionState::load())
@@ -257,6 +271,9 @@ impl App {
 
             // Throttled poll of st_client for the Live tab.
             self.maybe_refresh_live_clients();
+
+            // Fire any debounced sidebar table load whose selection has settled.
+            self.maybe_load_pending_table().await;
 
             // Expire notifications
             self.state.tick_notifications(Duration::from_secs(5));
@@ -760,7 +777,7 @@ impl App {
                 return;
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.nav_up();
+                self.nav_up().await;
                 return;
             }
             KeyCode::Char('g') | KeyCode::Home => {
@@ -1070,7 +1087,7 @@ impl App {
                     }
                 }
                 SidebarFocus::Tables => {
-                    self.state.table_next();
+                    self.select_table_delta(true).await;
                 }
             },
             FocusPanel::Main => match self.state.current_tab {
@@ -1119,14 +1136,14 @@ impl App {
         }
     }
 
-    fn nav_up(&mut self) {
+    async fn nav_up(&mut self) {
         match self.state.focus {
             FocusPanel::Sidebar => match self.state.sidebar_focus {
                 SidebarFocus::Databases => {
                     self.state.database_prev();
                 }
                 SidebarFocus::Tables => {
-                    self.state.table_prev();
+                    self.select_table_delta(false).await;
                 }
             },
             FocusPanel::Main => match self.state.current_tab {
@@ -1148,6 +1165,41 @@ impl App {
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// Cycle the sidebar table selection by one (forward or back) and, if
+    /// the selection actually changed, auto-load that table's data into
+    /// the Tables tab. This mirrors how moving between databases auto-loads
+    /// the schema: the main pane refreshes as the user steps through the
+    /// list, with no extra Enter press. Focus stays on the sidebar so
+    /// cycling can continue.
+    async fn select_table_delta(&mut self, forward: bool) {
+        let old = self.state.selected_table_idx;
+        if forward {
+            self.state.table_next();
+        } else {
+            self.state.table_prev();
+        }
+        if self.state.selected_table_idx != old {
+            self.state.current_tab = Tab::Tables;
+            self.tables_grid = TableGridState::new();
+            // Defer the fetch: the event loop fires it once the selection
+            // has been still for `TABLE_LOAD_DEBOUNCE`, so holding j/k
+            // doesn't issue a query for every table scrolled past.
+            self.pending_table_load = Some(Instant::now());
+        }
+    }
+
+    /// If a debounced sidebar table load is pending and the selection has
+    /// settled for `TABLE_LOAD_DEBOUNCE`, load that table's data. Called
+    /// once per event-loop tick.
+    async fn maybe_load_pending_table(&mut self) {
+        if let Some(changed_at) = self.pending_table_load {
+            if changed_at.elapsed() >= TABLE_LOAD_DEBOUNCE {
+                self.pending_table_load = None;
+                self.load_table_data_cached().await;
+            }
         }
     }
 
@@ -1217,8 +1269,9 @@ impl App {
                         }
                     }
                     SidebarFocus::Tables => {
-                        // Load the selected table's data
-                        self.load_table_data().await;
+                        // Load the selected table's data (cached if seen this
+                        // session; `r` forces a refresh).
+                        self.load_table_data_cached().await;
                         self.state.focus = FocusPanel::Main;
                         self.state.current_tab = Tab::Tables;
                         self.tables_grid = TableGridState::new();
@@ -1306,7 +1359,14 @@ impl App {
 
         tokio::spawn(async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql)).await {
-                Ok(Ok(result)) => send_event(&tx, AppEvent::TableBrowseResult { result }),
+                Ok(Ok(result)) => send_event(
+                    &tx,
+                    AppEvent::TableBrowseResult {
+                        database: db.clone(),
+                        table: table.clone(),
+                        result,
+                    },
+                ),
                 Ok(Err(e)) => send_event(
                     &tx,
                     AppEvent::TableBrowseError {
@@ -1321,6 +1381,33 @@ impl App {
                 ),
             }
         });
+    }
+
+    /// Show the selected table's data, preferring the session cache.
+    ///
+    /// Every successful load is cached (see the `TableBrowseResult`
+    /// handler) and entries never expire on their own, so revisiting a
+    /// table is instant and issues no query. Only an explicit refresh
+    /// (`r`, which calls [`load_table_data`] directly) refetches.
+    async fn load_table_data_cached(&mut self) {
+        let key = match (self.state.selected_database(), self.state.selected_table()) {
+            (Some(db), Some(t)) => Some((db.to_string(), t.table_name.clone())),
+            _ => None,
+        };
+        if let Some((db, table)) = key {
+            // `Duration::MAX` → cache-until-explicit-refresh (no TTL).
+            let cached = self
+                .state
+                .get_cached_table(&db, &table, Duration::MAX)
+                .map(|c| c.result.clone());
+            if let Some(result) = cached {
+                self.state.query_loading = false;
+                self.state.table_browse_result = Some(result);
+                self.tables_grid = TableGridState::new();
+                return;
+            }
+        }
+        self.load_table_data().await;
     }
 
     /// Return a reference to the `QueryResult` / `TableGridState` pair
@@ -3288,14 +3375,31 @@ impl App {
                 self.state.set_error(error);
             }
 
-            AppEvent::TableBrowseResult { result } => {
-                self.state.query_loading = false;
-                let row_count = result.row_count();
-                self.state.table_browse_result = Some(result);
-                // Reset the Tables grid scroll/selection on fresh data.
-                self.tables_grid = TableGridState::new();
+            AppEvent::TableBrowseResult {
+                database,
+                table,
+                result,
+            } => {
+                // Always cache, so cycling back to this table is instant and
+                // query-free until an explicit refresh (`r`) refetches it.
                 self.state
-                    .set_notification(format!("{row_count} rows loaded"));
+                    .cache_table_result(&database, &table, result.clone());
+
+                // Only paint it if the user is still looking at this table —
+                // a result from a table they've since cycled away from goes
+                // to the cache silently rather than flashing on screen.
+                let still_selected = self.state.selected_database() == Some(database.as_str())
+                    && self.state.selected_table().map(|t| t.table_name.as_str())
+                        == Some(table.as_str());
+                if still_selected {
+                    self.state.query_loading = false;
+                    let row_count = result.row_count();
+                    self.state.table_browse_result = Some(result);
+                    // Reset the Tables grid scroll/selection on fresh data.
+                    self.tables_grid = TableGridState::new();
+                    self.state
+                        .set_notification(format!("{row_count} rows loaded"));
+                }
             }
 
             AppEvent::TableBrowseError { error } => {

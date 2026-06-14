@@ -305,7 +305,6 @@ pub struct TableCache {
     /// The cached result set.
     pub result: QueryResult,
     /// When the cache entry was populated (used for cache expiry checks).
-    #[allow(dead_code)]
     pub fetched_at: Instant,
     /// Whether a refresh is currently in flight.
     #[allow(dead_code)]
@@ -821,7 +820,6 @@ impl AppState {
     }
 
     /// Store a query result in the table cache.
-    #[allow(dead_code)]
     pub fn cache_table_result(&mut self, database: &str, table_name: &str, result: QueryResult) {
         let key = Self::cache_key(database, table_name);
         self.table_cache.insert(
@@ -835,7 +833,6 @@ impl AppState {
     }
 
     /// Retrieve a cached result, if present and not older than `max_age`.
-    #[allow(dead_code)]
     pub fn get_cached_table(
         &self,
         database: &str,
