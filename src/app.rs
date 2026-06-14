@@ -3161,6 +3161,21 @@ impl App {
                         self.state.databases.insert(0, db);
                     }
                 }
+                // Sort for a stable, predictable order — the list endpoint
+                // returns names in arbitrary order, so without this the
+                // sidebar reshuffles on every reload. Re-resolve the current
+                // selection by name afterwards so sorting doesn't move the
+                // cursor onto a different database.
+                let selected_name = self.state.selected_database().map(str::to_string);
+                self.state.databases.sort_by(|a, b| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .cmp(&b.name.to_ascii_lowercase())
+                });
+                if let Some(name) = selected_name {
+                    self.state.selected_database_idx =
+                        self.state.databases.iter().position(|d| d.name == name);
+                }
                 // If a previous session left a "last database" hint
                 // and we still have no selection, try to land on it.
                 if self.state.selected_database_idx.is_none() {
