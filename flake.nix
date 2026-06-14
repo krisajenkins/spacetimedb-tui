@@ -13,10 +13,49 @@
           overlays = [
           ];
         };
-
       in
-      {
-        packages = { };
+      rec {
+        packages = rec {
+          spacetimedb-tui = pkgs.rustPlatform.buildRustPackage {
+            pname = "spacetimedb-tui";
+            version = "0.1.0";
+            src = ./.;
+
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+
+            nativeBuildInputs = [
+              pkgs.pkg-config
+            ];
+
+            buildInputs = [
+              pkgs.openssl
+            ];
+
+            meta = with pkgs.lib; {
+              description = "A terminal user interface for SpacetimeDB";
+              homepage = "https://github.com/clockworklabs/spacetimedb-tui";
+              license = licenses.mit;
+              maintainers = [ ];
+              mainProgram = "spacetimedb-tui";
+            };
+          };
+
+          default = spacetimedb-tui;
+        };
+
+        apps.default = {
+          type = "app";
+          meta = packages.spacetimedb-tui.meta;
+          program = "${self.packages.${system}.spacetimedb-tui}/bin/spacetimedb-tui";
+        };
+
+        checks = {
+          build = self.packages.${system}.spacetimedb-tui;
+        };
+
+        formatter = pkgs.nixpkgs-fmt;
 
         devShells.default = with pkgs;
           mkShell {
