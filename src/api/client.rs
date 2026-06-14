@@ -184,6 +184,14 @@ impl SpacetimeClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            // Surface "paused" as a typed error so the caller can flag
+            // the database in the UI, not just show a one-off message.
+            if is_paused_response(status.as_u16(), &body) {
+                return Err(DatabasePaused {
+                    database: database.to_string(),
+                }
+                .into());
+            }
             bail!(schema_error_message(database, status.as_u16(), &body));
         }
 
@@ -632,10 +640,45 @@ fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
     Some(result)
 }
 
+/// Whether a non-success response means "this database is paused".
+///
+/// Maincloud suspends inactive databases and then returns
+/// `503 database is paused` on *every* endpoint (schema, SQL, even the
+/// WebSocket subscribe upgrade). It is server-side state, not a
+/// protocol/version mismatch, and the client cannot resume it — the
+/// database must be woken from the SpacetimeDB dashboard (or republished).
+fn is_paused_response(status: u16, body: &str) -> bool {
+    status == 503 && body.to_lowercase().contains("paused")
+}
+
+/// A paused database, surfaced as a distinct error type so callers can
+/// flag the database in the UI (and clear the flag when it resumes)
+/// rather than only showing a transient message. Its `Display` is the
+/// user-facing message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabasePaused {
+    pub database: String,
+}
+
+impl std::fmt::Display for DatabasePaused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Database '{}' is paused. SpacetimeDB Maincloud suspends \
+             inactive databases; resume it from the dashboard at \
+             https://spacetimedb.com (or republish it), then reconnect.",
+            self.database
+        )
+    }
+}
+
+impl std::error::Error for DatabasePaused {}
+
 /// Build a human-readable error for a non-success `GET /schema` response.
 ///
 /// Kept as a pure function (status code + body in, message out) so the
 /// classification can be unit-tested without standing up an HTTP server.
+/// The paused case is handled separately via [`DatabasePaused`].
 fn schema_error_message(database: &str, status: u16, body: &str) -> String {
     let body_snip: String = body.chars().take(200).collect();
     match status {
@@ -649,17 +692,6 @@ fn schema_error_message(database: &str, status: u16, body: &str) -> String {
         404 => format!(
             "Schema HTTP 404 — database '{database}' does not exist \
              or is not visible to the current identity"
-        ),
-        // Maincloud suspends inactive databases. Every endpoint
-        // (schema, SQL, even the WebSocket subscribe upgrade) then
-        // returns `503 database is paused`. This is server-side state,
-        // not a protocol/version mismatch, and the client cannot resume
-        // it — the database must be woken from the SpacetimeDB dashboard
-        // (or by republishing it).
-        503 if body.to_lowercase().contains("paused") => format!(
-            "Database '{database}' is paused. SpacetimeDB Maincloud \
-             suspends inactive databases; resume it from the dashboard \
-             at https://spacetimedb.com (or republish it), then reconnect."
         ),
         _ => format!("Schema HTTP {status}: {body_snip}"),
     }
@@ -1363,33 +1395,44 @@ mod tests {
         assert!(cols.is_empty());
     }
 
-    // ── Schema error classification ─────────────────────────────────────
+    // ── Paused-database detection ───────────────────────────────────────
 
     #[test]
-    fn schema_error_503_paused_is_actionable() {
+    fn paused_response_detects_503_with_paused_body() {
         // Maincloud returns `503 database is paused` for suspended
-        // databases. The message must name the database, say it's
-        // paused, and tell the user how to resume — not leak the raw
-        // "Schema HTTP 503 Service Unavailable" body.
-        let msg = schema_error_message("space-dungeon", 503, "database is paused");
+        // databases. Casing varies, so match case-insensitively.
+        assert!(is_paused_response(503, "database is paused"));
+        assert!(is_paused_response(503, "Database Is Paused"));
+    }
+
+    #[test]
+    fn paused_response_ignores_other_503s_and_codes() {
+        // A 503 that isn't a pause (e.g. genuine outage) is not paused.
+        assert!(!is_paused_response(503, "upstream timeout"));
+        // The same body on a different status is not paused either.
+        assert!(!is_paused_response(500, "database is paused"));
+    }
+
+    #[test]
+    fn database_paused_display_is_actionable() {
+        // The typed error's Display is the user-facing message: it must
+        // name the database, say it's paused, and say how to resume.
+        let msg = DatabasePaused {
+            database: "space-dungeon".to_string(),
+        }
+        .to_string();
         assert!(msg.contains("space-dungeon"));
         assert!(msg.to_lowercase().contains("paused"));
         assert!(msg.contains("dashboard"));
-        assert!(!msg.contains("Schema HTTP 503"));
+        assert!(!msg.contains("HTTP"));
     }
 
-    #[test]
-    fn schema_error_503_paused_case_insensitive() {
-        // Body casing varies; the paused branch must still match.
-        let msg = schema_error_message("db", 503, "Database Is Paused");
-        assert!(msg.to_lowercase().contains("paused"));
-        assert!(msg.contains("dashboard"));
-    }
+    // ── Schema error classification ─────────────────────────────────────
 
     #[test]
-    fn schema_error_503_without_paused_falls_through() {
-        // A 503 that isn't a pause (e.g. genuine outage) keeps the
-        // generic message so we don't mislabel it.
+    fn schema_error_generic_503_falls_through() {
+        // A non-paused 503 keeps the generic message (paused is handled
+        // separately via DatabasePaused before this is reached).
         let msg = schema_error_message("db", 503, "upstream timeout");
         assert!(msg.contains("Schema HTTP 503"));
         assert!(msg.contains("upstream timeout"));

@@ -19,9 +19,9 @@ use anyhow::{Context, Result};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use tracing::info;
 
 use crate::{api::SpacetimeClient, app::App, config::Config};
@@ -59,7 +59,9 @@ async fn async_main(config: Config) -> Result<()> {
 
     // Pre-select the database from the CLI flag if provided.
     if let Some(db) = &config.database {
-        app.state.databases.push(db.clone());
+        app.state
+            .databases
+            .push(crate::state::Database::new(db.clone()));
         app.state.select_database(0);
     }
 
@@ -103,7 +105,7 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
 // ── Tracing ───────────────────────────────────────────────────────────────────
 
 fn init_tracing(level: &str) {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     fmt()
         .with_env_filter(filter)

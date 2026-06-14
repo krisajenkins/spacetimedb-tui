@@ -200,6 +200,43 @@ impl TxLogEntry {
     }
 }
 
+/// Last-known status of a database.
+///
+/// We can't read this from the database list (which returns names only);
+/// it's discovered when we actually talk to a database. `Unknown` is the
+/// initial state until the first schema fetch resolves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DatabaseStatus {
+    /// Not yet probed.
+    #[default]
+    Unknown,
+    /// Responding normally (a schema fetch succeeded).
+    Active,
+    /// Suspended by Maincloud (`503 database is paused`).
+    Paused,
+}
+
+/// A database visible to the current identity, plus its last-known status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Database {
+    pub name: String,
+    pub status: DatabaseStatus,
+}
+
+impl Database {
+    /// A database with not-yet-probed status.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: DatabaseStatus::Unknown,
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.status == DatabaseStatus::Paused
+    }
+}
+
 /// One row in the Live tab's connected-client list.
 #[derive(Debug, Clone)]
 pub struct LiveClientEntry {
@@ -302,8 +339,9 @@ pub struct AppState {
     // ------------------------------------------------------------------
     // Database / table navigation
     // ------------------------------------------------------------------
-    /// All databases visible to the current identity.
-    pub databases: Vec<String>,
+    /// All databases visible to the current identity, each carrying its
+    /// last-known status.
+    pub databases: Vec<Database>,
     /// Index of the currently selected database in `databases`.
     pub selected_database_idx: Option<usize>,
     /// Tables belonging to the currently selected database.
@@ -548,7 +586,14 @@ impl AppState {
     pub fn selected_database(&self) -> Option<&str> {
         self.selected_database_idx
             .and_then(|i| self.databases.get(i))
-            .map(String::as_str)
+            .map(|d| d.name.as_str())
+    }
+
+    /// Set the status of the database named `name`, if present.
+    pub fn set_database_status(&mut self, name: &str, status: DatabaseStatus) {
+        if let Some(db) = self.databases.iter_mut().find(|d| d.name == name) {
+            db.status = status;
+        }
     }
 
     /// Select the database at `idx`, resetting table selection.
@@ -940,13 +985,31 @@ mod tests {
     #[test]
     fn test_database_navigation() {
         let mut s = make_state();
-        s.databases = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        s.databases = vec![
+            Database::new("alpha"),
+            Database::new("beta"),
+            Database::new("gamma"),
+        ];
         s.database_next();
         assert_eq!(s.selected_database(), Some("alpha"));
         s.database_next();
         assert_eq!(s.selected_database(), Some("beta"));
         s.database_prev();
         assert_eq!(s.selected_database(), Some("alpha"));
+    }
+
+    #[test]
+    fn test_set_database_status() {
+        let mut s = make_state();
+        s.databases = vec![Database::new("alpha"), Database::new("beta")];
+        assert_eq!(s.databases[0].status, DatabaseStatus::Unknown);
+        s.set_database_status("alpha", DatabaseStatus::Paused);
+        assert!(s.databases[0].is_paused());
+        assert_eq!(s.databases[1].status, DatabaseStatus::Unknown);
+        // Unknown name is a silent no-op.
+        s.set_database_status("nope", DatabaseStatus::Active);
+        s.set_database_status("alpha", DatabaseStatus::Active);
+        assert_eq!(s.databases[0].status, DatabaseStatus::Active);
     }
 
     #[test]

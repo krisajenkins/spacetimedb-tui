@@ -47,6 +47,10 @@ pub enum AppEvent {
     /// Separate from the generic `Error` variant so the handler can
     /// clear `schema_loading` and flip `schema_load_failed` atomically.
     SchemaError(String),
+    /// Schema fetch found the database paused (maincloud suspends
+    /// inactive databases). Flags the database as paused and shows the
+    /// message, rather than reporting a generic schema failure.
+    SchemaPaused { database: String, message: String },
     /// SQL query result arrived (user-typed SQL in the SQL console tab).
     QueryResult {
         result: crate::api::types::QueryResult,
@@ -1257,10 +1261,24 @@ impl App {
         tokio::spawn(async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_schema(&db)).await {
                 Ok(Ok(schema)) => send_event(&tx, AppEvent::SchemaLoaded(schema)),
-                Ok(Err(e)) => send_event(
-                    &tx,
-                    AppEvent::SchemaError(format!("Schema load failed: {e:#}")),
-                ),
+                Ok(Err(e)) => {
+                    // A paused database is a distinct, expected state — flag
+                    // the database rather than reporting a generic failure.
+                    if let Some(paused) = e.downcast_ref::<crate::api::client::DatabasePaused>() {
+                        send_event(
+                            &tx,
+                            AppEvent::SchemaPaused {
+                                database: db.clone(),
+                                message: paused.to_string(),
+                            },
+                        );
+                    } else {
+                        send_event(
+                            &tx,
+                            AppEvent::SchemaError(format!("Schema load failed: {e:#}")),
+                        );
+                    }
+                }
                 Err(_) => send_event(
                     &tx,
                     AppEvent::SchemaError("Schema load timed out".to_string()),
@@ -3130,11 +3148,28 @@ impl App {
 
             AppEvent::DatabasesLoaded(dbs) => {
                 self.state.connection.status = ConnectionStatus::Connected;
-                // Preserve any pre-selected DB
-                let existing: Vec<_> = self.state.databases.drain(..).collect();
-                self.state.databases = dbs;
+                // The list call returns names only; rebuild the database
+                // list from them while carrying over any status we'd
+                // already discovered for a name.
+                let existing: Vec<crate::state::Database> =
+                    self.state.databases.drain(..).collect();
+                let prior_status = |name: &str| {
+                    existing
+                        .iter()
+                        .find(|d| d.name == name)
+                        .map(|d| d.status)
+                        .unwrap_or_default()
+                };
+                self.state.databases = dbs
+                    .into_iter()
+                    .map(|name| crate::state::Database {
+                        status: prior_status(&name),
+                        name,
+                    })
+                    .collect();
+                // Preserve any pre-selected DB not present in the new list.
                 for db in existing {
-                    if !self.state.databases.contains(&db) {
+                    if !self.state.databases.iter().any(|d| d.name == db.name) {
                         self.state.databases.insert(0, db);
                     }
                 }
@@ -3144,7 +3179,7 @@ impl App {
                     if let Some(session) = self.pending_session.as_ref() {
                         if let Some(ref last_db) = session.last_database {
                             if let Some(idx) =
-                                self.state.databases.iter().position(|d| d == last_db)
+                                self.state.databases.iter().position(|d| &d.name == last_db)
                             {
                                 self.state.select_database(idx);
                                 if let Some(tab_idx) = session.last_tab {
@@ -3164,6 +3199,12 @@ impl App {
             AppEvent::SchemaLoaded(schema) => {
                 self.state.schema_loading = false;
                 self.state.schema_load_failed = false;
+                // The schema came back, so this database is responding —
+                // clear any stale paused flag.
+                if let Some(name) = self.state.selected_database().map(str::to_string) {
+                    self.state
+                        .set_database_status(&name, crate::state::DatabaseStatus::Active);
+                }
                 self.state.tables = schema.tables.clone();
                 // If we restored a session and the user was looking at
                 // a specific table, jump to it instead of defaulting
@@ -3198,6 +3239,14 @@ impl App {
                 self.state.schema_loading = false;
                 self.state.schema_load_failed = true;
                 self.state.set_error(msg);
+            }
+
+            AppEvent::SchemaPaused { database, message } => {
+                self.state.schema_loading = false;
+                self.state.schema_load_failed = true;
+                self.state
+                    .set_database_status(&database, crate::state::DatabaseStatus::Paused);
+                self.state.set_error(message);
             }
 
             AppEvent::QueryResult {

@@ -32,6 +32,20 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 spacetime list   # enumerate the identity's databases
 ```
 
+## State model
+
+- Databases are stored as `state.databases: Vec<Database>`, where each
+  `Database` carries a `name` and a `status` (`DatabaseStatus::Unknown` /
+  `Active` / `Paused`). Defined in `state/app_state.rs`, re-exported from
+  `state`.
+- **Status can't be read from the database list** (it returns names only),
+  so it's discovered reactively, not on startup. `get_schema` returns a
+  typed `DatabasePaused` error on a `503 ... paused` response; the app turns
+  that into `AppEvent::SchemaPaused`, sets the database's status, and the
+  sidebar renders a `⏸ paused` marker. A successful schema load flips it
+  back to `Active`. A startup probe (one schema check per DB) was considered
+  and deliberately not added — kept reactive to avoid N requests on launch.
+
 ## UI conventions
 
 - `state.error_message` is modal: while set, `handle_key` swallows every key

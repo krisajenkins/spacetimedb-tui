@@ -11,6 +11,6 @@ pub mod palette;
 
 // Re-export the most commonly used items.
 pub use app_state::{
-    AppState, ConnectionStatus, FocusPanel, HistoryAdvance, MetricsSnapshot, SidebarFocus,
-    SqlHistoryEntry, Tab, TxLogEntry,
+    AppState, ConnectionStatus, Database, DatabaseStatus, FocusPanel, HistoryAdvance,
+    MetricsSnapshot, SidebarFocus, SqlHistoryEntry, Tab, TxLogEntry,
 };

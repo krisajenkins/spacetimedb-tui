@@ -198,18 +198,20 @@ fn build_items(app: &AppState) -> Vec<TreeItem> {
 
     for (di, db) in app.databases.iter().enumerate() {
         // Filter by search
-        if !search.is_empty() && !db.to_lowercase().contains(&search) {
+        if !search.is_empty() && !db.name.to_lowercase().contains(&search) {
             continue;
         }
 
         let is_selected_db = app.selected_database_idx == Some(di);
         let arrow = if is_selected_db { "▼" } else { "▶" };
-        let display = display_db_name(db);
-        let label = format!("  {arrow} {display}");
+        let display = display_db_name(&db.name);
+        // Flag paused databases — maincloud suspends inactive ones.
+        let suffix = if db.is_paused() { "  ⏸ paused" } else { "" };
+        let label = format!("  {arrow} {display}{suffix}");
 
         items.push(TreeItem {
             label,
-            fg: DB_FG,
+            fg: if db.is_paused() { MUTED } else { DB_FG },
             is_db: true,
             idx: di,
         });
@@ -239,7 +241,7 @@ fn build_items(app: &AppState) -> Vec<TreeItem> {
                     // Filter tables too
                     if !search.is_empty()
                         && !table.table_name.to_lowercase().contains(&search)
-                        && !db.to_lowercase().contains(&search)
+                        && !db.name.to_lowercase().contains(&search)
                     {
                         continue;
                     }
@@ -288,5 +290,36 @@ fn compute_scroll(selected: Option<usize>, visible_h: usize, total: usize) -> us
                 sel.saturating_sub(visible_h / 2)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Database, DatabaseStatus};
+
+    #[test]
+    fn paused_database_row_is_flagged() {
+        let mut app = AppState::new("http://localhost:3000");
+        app.databases = vec![
+            Database::new("active-db"),
+            Database {
+                name: "paused-db".to_string(),
+                status: DatabaseStatus::Paused,
+            },
+        ];
+
+        let items = build_items(&app);
+        let active = items
+            .iter()
+            .find(|i| i.label.contains("active-db"))
+            .unwrap();
+        let paused = items
+            .iter()
+            .find(|i| i.label.contains("paused-db"))
+            .unwrap();
+
+        assert!(!active.label.contains("paused"));
+        assert!(paused.label.contains("⏸ paused"));
     }
 }
