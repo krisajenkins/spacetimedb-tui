@@ -18,8 +18,8 @@ use ratatui::widgets::Widget;
 
 use crate::{
     api::{
-        ws::{WsConfig, WsEvent, WsHandle},
         SpacetimeClient,
+        ws::{WsConfig, WsEvent, WsHandle},
     },
     config::Config,
     state::{
@@ -2742,7 +2742,7 @@ impl App {
     /// shared by multiple matches and surfaces the candidate list as a
     /// notification, or (c) shows a "no match" notification.
     fn complete_sql_input(&mut self) {
-        use crate::ui::components::completion::{build_candidates, complete, CompletionResult};
+        use crate::ui::components::completion::{CompletionResult, build_candidates, complete};
 
         let (range, word) = self.sql_input.current_word();
         if word.is_empty() {
@@ -3983,7 +3983,8 @@ pub fn draw_frame(
 ) {
     use crate::ui::{
         components::{
-            help::HelpOverlay, modal::render_modal, palette::render_palette, status_bar::StatusBar,
+            error::render_error, help::HelpOverlay, modal::render_modal, palette::render_palette,
+            status_bar::StatusBar,
         },
         layout::render_layout,
         sidebar::render_sidebar,
@@ -4047,6 +4048,16 @@ pub fn draw_frame(
 
     // ── Status bar ────────────────────────────────────────────────────────
     StatusBar::new(state).render(status_area, frame.buffer_mut());
+
+    // ── Error overlay ─────────────────────────────────────────────────────
+    // Rendered above the tab content but below help/modal/palette, mirroring
+    // the input precedence in `handle_key` (those overlays capture keys
+    // before the error does). While an error is shown every key except
+    // Esc/Enter is swallowed, so it must be plainly visible — not a 40-char
+    // sliver in the status-bar corner.
+    if let Some(ref err) = state.error_message {
+        render_error(area, frame.buffer_mut(), err);
+    }
 
     // ── Help overlay (drawn on top of everything) ─────────────────────────
     if state.show_help {
