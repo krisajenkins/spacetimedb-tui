@@ -1,6 +1,9 @@
 //! User-level config + session state for the SpacetimeDB TUI.
 //!
-//! Two files live under `~/.config/spacetimedb-tui/`:
+//! Two files live under the platform config directory
+//! (`~/.config/spacetimedb-tui/` on Linux, `~/Library/Application
+//! Support/spacetimedb-tui/` on macOS, `%APPDATA%\spacetimedb-tui\` on
+//! Windows — see [`config_dir`]):
 //!
 //! - **`config.toml`** — persistent user preferences (default theme,
 //!   default database, optional `themes_dir`). Hand-written and never

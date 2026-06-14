@@ -206,7 +206,7 @@ Persistent preferences live at the platform-specific config directory:
 | **macOS** | `~/Library/Application Support/spacetimedb-tui/config.toml` |
 | **Windows** | `%APPDATA%\spacetimedb-tui\config.toml` |
 
-The SpacetimeDB CLI config (`spacetime/cli.toml`) is looked up in the same root, so credentials created by `spacetime login` are picked up automatically on every platform.
+The SpacetimeDB CLI config is **not** looked up in this root. The `spacetime` CLI stores its own config under `~/.config/spacetime/cli.toml` on _every_ platform (honouring `XDG_CONFIG_HOME`; it does not use `~/Library` on macOS), so that is where the TUI reads credentials created by `spacetime login` from — see [Auto-Configuration](#auto-configuration) above.
 
 Example contents:
 

@@ -4,7 +4,10 @@
 //! environment variables.  It is constructed once at startup and then passed
 //! (by reference or `Arc`) wherever it is needed.
 
-use anyhow::{bail, Result};
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+use anyhow::{Result, bail};
 use clap::Parser;
 use serde::Deserialize;
 
@@ -12,7 +15,7 @@ use serde::Deserialize;
 // SpacetimeDB CLI config auto-detection
 // ---------------------------------------------------------------------------
 
-/// Values pulled from `~/.config/spacetime/cli.toml`.
+/// Values pulled from the SpacetimeDB CLI config (`spacetime/cli.toml`).
 #[derive(Debug, Default)]
 struct SpacetimeCliConfig {
     token: Option<String>,
@@ -21,21 +24,66 @@ struct SpacetimeCliConfig {
     uses_tls: bool,
 }
 
-/// Try to read and parse the SpacetimeDB CLI config file.
+/// Locate the SpacetimeDB CLI config file.
 ///
-/// Looks in the platform-specific config directory:
-/// - Linux:   `~/.config/spacetime/cli.toml`
-/// - macOS:   `~/Library/Application Support/spacetime/cli.toml`
-/// - Windows: `%APPDATA%\spacetime\cli.toml`
+/// Unlike *our own* config (see [`crate::user_config::config_dir`]), the
+/// SpacetimeDB CLI does **not** follow the OS-specific convention — it stores
+/// its config under `~/.config/spacetime/` on **every** platform, honouring
+/// `XDG_CONFIG_HOME` when set. In particular it does *not* use macOS's
+/// `~/Library/Application Support`, so we must not resolve this path via
+/// `dirs::config_dir()` (which would silently miss the file on macOS).
+fn spacetime_cli_config_path() -> Option<PathBuf> {
+    spacetime_cli_config_path_from(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir())
+}
+
+/// Pure resolver for [`spacetime_cli_config_path`], split out so the
+/// precedence rules can be unit-tested without touching the environment.
+fn spacetime_cli_config_path_from(
+    xdg_config_home: Option<OsString>,
+    home_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let config_home = match xdg_config_home.filter(|v| !v.is_empty()) {
+        Some(xdg) => PathBuf::from(xdg),
+        None => home_dir?.join(".config"),
+    };
+    Some(config_home.join("spacetime").join("cli.toml"))
+}
+
+/// Try to read and parse the SpacetimeDB CLI config file from
+/// `~/.config/spacetime/cli.toml` (or `$XDG_CONFIG_HOME/spacetime/cli.toml`).
 ///
 /// Returns `None` when the file does not exist or cannot be parsed.
 fn read_spacetime_cli_config() -> Option<SpacetimeCliConfig> {
-    let path = dirs::config_dir()?.join("spacetime/cli.toml");
+    let path = spacetime_cli_config_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
     parse_spacetime_cli_toml(&content)
 }
 
-/// Parse the simplified TOML format used by the SpacetimeDB CLI.
+/// On-disk shape of the SpacetimeDB CLI config, for `serde`/`toml`.
+///
+/// Only the fields we care about are declared; unknown keys (e.g.
+/// `web_session_token`) are ignored.
+#[derive(Debug, Deserialize)]
+struct RawCliConfig {
+    #[serde(default)]
+    default_server: Option<String>,
+    #[serde(default)]
+    spacetimedb_token: Option<String>,
+    #[serde(default)]
+    server_configs: Vec<RawServerConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawServerConfig {
+    #[serde(default)]
+    nickname: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
+}
+
+/// Parse the TOML format used by the SpacetimeDB CLI.
 ///
 /// The file looks like:
 /// ```toml
@@ -48,86 +96,35 @@ fn read_spacetime_cli_config() -> Option<SpacetimeCliConfig> {
 /// protocol = "http"
 /// ```
 fn parse_spacetime_cli_toml(content: &str) -> Option<SpacetimeCliConfig> {
-    let mut default_server: Option<String> = None;
-    let mut token: Option<String> = None;
+    let raw: RawCliConfig = toml::from_str(content).ok()?;
 
-    // Collected server configs: (nickname, host, protocol)
-    let mut servers: Vec<(String, String, String)> = Vec::new();
+    // Locate the server matching `default_server` (falling back to "local").
+    let want = raw.default_server.as_deref().unwrap_or("local");
+    let server = raw
+        .server_configs
+        .iter()
+        .find(|s| s.nickname.as_deref() == Some(want));
 
-    let mut in_server = false;
-    let mut cur_nick = String::new();
-    let mut cur_host = String::new();
-    let mut cur_proto = String::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    let (host, port, uses_tls) = match server.and_then(|s| s.host.as_deref().map(|h| (s, h))) {
+        Some((s, host_str)) => {
+            let is_https = s.protocol.as_deref() == Some("https");
+            // When the host carries no explicit port, fall back to the
+            // protocol's standard port (443 for https, 80 for http) rather
+            // than the local-dev default of 3000. maincloud, for example, is
+            // `maincloud.spacetimedb.com` over https → 443, not 3000.
+            let default_port = if is_https { 443 } else { 80 };
+            let (h, p) = split_host_port(host_str, default_port);
+            (Some(h), Some(p), is_https)
         }
-
-        if line == "[[server_configs]]" {
-            if in_server {
-                servers.push((cur_nick.clone(), cur_host.clone(), cur_proto.clone()));
-            }
-            in_server = true;
-            cur_nick.clear();
-            cur_host.clear();
-            cur_proto.clear();
-            continue;
-        }
-
-        if let Some((key, val)) = parse_toml_string_kv(line) {
-            if in_server {
-                match key {
-                    "nickname" => cur_nick = val,
-                    "host" => cur_host = val,
-                    "protocol" => cur_proto = val,
-                    _ => {}
-                }
-            } else {
-                match key {
-                    "default_server" => default_server = Some(val),
-                    "spacetimedb_token" => token = Some(val),
-                    _ => {}
-                }
-            }
-        }
-    }
-    // Flush the last server section.
-    if in_server && !cur_nick.is_empty() {
-        servers.push((cur_nick, cur_host, cur_proto));
-    }
-
-    // Locate the server matching `default_server`.
-    let want = default_server.as_deref().unwrap_or("local");
-    let server = servers.iter().find(|(nick, _, _)| nick == want);
-
-    let (host, port, uses_tls) = if let Some((_, host_str, protocol)) = server {
-        let (h, p) = split_host_port(host_str, 3000);
-        (Some(h), Some(p), protocol == "https")
-    } else {
-        (None, None, false)
+        None => (None, None, false),
     };
 
     Some(SpacetimeCliConfig {
-        token,
+        token: raw.spacetimedb_token,
         host,
         port,
         uses_tls,
     })
-}
-
-/// Parse `key = "value"` (or `key = value`) from a single TOML line.
-fn parse_toml_string_kv(line: &str) -> Option<(&str, String)> {
-    let eq = line.find('=')?;
-    let key = line[..eq].trim();
-    let raw = line[eq + 1..].trim();
-    let val = if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
-        raw[1..raw.len() - 1].to_string()
-    } else {
-        raw.to_string()
-    };
-    Some((key, val))
 }
 
 /// Split `"host:port"` into `(host, port)`, with `default_port` as fallback.
@@ -425,8 +422,8 @@ impl Config {
     /// Build a [`Config`] from parsed CLI arguments.
     ///
     /// When `--host`/`--port` are at their defaults and/or `--token` is not
-    /// supplied, values are sourced from `~/.config/spacetime/cli.toml` (the
-    /// SpacetimeDB CLI config) if that file exists.
+    /// supplied, values are sourced from the SpacetimeDB CLI config
+    /// (`~/.config/spacetime/cli.toml` on every platform) if that file exists.
     ///
     /// # Errors
     /// Returns an error if the port is 0 or the host is empty.
@@ -621,6 +618,127 @@ mod tests {
         // matching file in their real ~/.config we'd accidentally
         // hit it. But the test asserts the function doesn't panic.
         let _ = result;
+    }
+
+    #[test]
+    fn spacetime_cli_path_prefers_xdg_config_home() {
+        let p = spacetime_cli_config_path_from(
+            Some(OsString::from("/custom/xdg")),
+            Some(PathBuf::from("/home/alice")),
+        )
+        .unwrap();
+        assert_eq!(p, PathBuf::from("/custom/xdg/spacetime/cli.toml"));
+    }
+
+    #[test]
+    fn spacetime_cli_path_falls_back_to_dot_config_under_home() {
+        // No XDG, and empty XDG, both fall through to ~/.config — NOT
+        // ~/Library on macOS, which is the whole point of this resolver.
+        for xdg in [None, Some(OsString::from(""))] {
+            let p =
+                spacetime_cli_config_path_from(xdg, Some(PathBuf::from("/home/alice"))).unwrap();
+            assert_eq!(p, PathBuf::from("/home/alice/.config/spacetime/cli.toml"));
+        }
+    }
+
+    #[test]
+    fn spacetime_cli_path_none_without_home_or_xdg() {
+        assert!(spacetime_cli_config_path_from(None, None).is_none());
+    }
+
+    #[test]
+    fn parse_cli_toml_picks_default_server() {
+        let toml = r#"
+            default_server = "maincloud"
+            spacetimedb_token = "tok123"
+
+            [[server_configs]]
+            nickname = "maincloud"
+            host = "maincloud.spacetimedb.com"
+            protocol = "https"
+
+            [[server_configs]]
+            nickname = "local"
+            host = "127.0.0.1:3000"
+            protocol = "http"
+        "#;
+        let cfg = parse_spacetime_cli_toml(toml).unwrap();
+        assert_eq!(cfg.token.as_deref(), Some("tok123"));
+        assert_eq!(cfg.host.as_deref(), Some("maincloud.spacetimedb.com"));
+        // No port in the host string → falls back to the protocol default
+        // (https → 443), NOT the local-dev 3000.
+        assert_eq!(cfg.port, Some(443));
+        assert!(cfg.uses_tls);
+    }
+
+    #[test]
+    fn parse_cli_toml_default_server_falls_back_to_local() {
+        // No `default_server` key → resolver looks for "local".
+        let toml = r#"
+            spacetimedb_token = "tok123"
+
+            [[server_configs]]
+            nickname = "local"
+            host = "127.0.0.1:3000"
+            protocol = "http"
+        "#;
+        let cfg = parse_spacetime_cli_toml(toml).unwrap();
+        assert_eq!(cfg.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(cfg.port, Some(3000));
+        assert!(!cfg.uses_tls);
+    }
+
+    #[test]
+    fn parse_cli_toml_http_without_port_defaults_to_80() {
+        let toml = r#"
+            default_server = "remote"
+
+            [[server_configs]]
+            nickname = "remote"
+            host = "example.com"
+            protocol = "http"
+        "#;
+        let cfg = parse_spacetime_cli_toml(toml).unwrap();
+        assert_eq!(cfg.host.as_deref(), Some("example.com"));
+        assert_eq!(cfg.port, Some(80));
+        assert!(!cfg.uses_tls);
+    }
+
+    #[test]
+    fn parse_cli_toml_explicit_port_overrides_protocol_default() {
+        let toml = r#"
+            default_server = "remote"
+
+            [[server_configs]]
+            nickname = "remote"
+            host = "example.com:8443"
+            protocol = "https"
+        "#;
+        let cfg = parse_spacetime_cli_toml(toml).unwrap();
+        assert_eq!(cfg.port, Some(8443));
+        assert!(cfg.uses_tls);
+    }
+
+    #[test]
+    fn parse_cli_toml_token_only_when_no_matching_server() {
+        let toml = r#"
+            default_server = "missing"
+            spacetimedb_token = "tok123"
+
+            [[server_configs]]
+            nickname = "local"
+            host = "127.0.0.1:3000"
+            protocol = "http"
+        "#;
+        let cfg = parse_spacetime_cli_toml(toml).unwrap();
+        assert_eq!(cfg.token.as_deref(), Some("tok123"));
+        assert!(cfg.host.is_none());
+        assert!(cfg.port.is_none());
+    }
+
+    #[test]
+    fn parse_cli_toml_rejects_garbage() {
+        assert!(parse_spacetime_cli_toml("this is = not [valid toml").is_none());
     }
 
     #[test]
