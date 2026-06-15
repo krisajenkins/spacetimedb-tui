@@ -151,6 +151,45 @@ fn split_host_port(addr: &str, default_port: u16) -> (String, u16) {
     (addr.to_string(), default_port)
 }
 
+/// Resolve the `(host, port, tls)` to connect to from the CLI flags and the
+/// optional SpacetimeDB CLI config.
+///
+/// The user is considered to have **explicitly chosen a server** when they
+/// pass any of `--host`, `--port`, or `--tls` (on the command line or via the
+/// matching env var). In that case the CLI config is ignored entirely — even
+/// if the values happen to equal the built-in defaults — so that
+/// `-H localhost -p 3000` always reaches a local server rather than being
+/// silently replaced by the CLI config's `default_server`.
+///
+/// Only when *no* server flag is given do we fall back to the CLI config, and
+/// finally to `localhost:3000` without TLS.
+fn resolve_server(
+    cli_host: Option<String>,
+    cli_port: Option<u16>,
+    cli_tls: bool,
+    cli_cfg: Option<&SpacetimeCliConfig>,
+) -> (String, u16, bool) {
+    // `--tls` is a `SetTrue` flag, so `false` is indistinguishable from unset;
+    // treat `true` as an explicit server choice, `false` as "not specified".
+    let server_explicit = cli_host.is_some() || cli_port.is_some() || cli_tls;
+
+    if !server_explicit {
+        if let Some(cc) = cli_cfg {
+            return (
+                cc.host.clone().unwrap_or_else(|| "localhost".to_string()),
+                cc.port.unwrap_or(3000),
+                cc.uses_tls,
+            );
+        }
+    }
+
+    (
+        cli_host.unwrap_or_else(|| "localhost".to_string()),
+        cli_port.unwrap_or(3000),
+        cli_tls,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // CLI argument definition
 // ---------------------------------------------------------------------------
@@ -165,25 +204,27 @@ fn split_host_port(addr: &str, default_port: u16) -> (String, u16) {
     long_about = None,
 )]
 pub struct Cli {
-    /// Hostname or IP address of the SpacetimeDB server.
+    // No `default_value`: an unset (`None`) host means "the user did not pick
+    // a server", which lets `Config::from_cli` fall back to the SpacetimeDB
+    // CLI config. Defaults to `localhost` only when neither the flag, the env
+    // var, nor the CLI config supplies one.
     #[arg(
         short = 'H',
         long,
-        default_value = "localhost",
         env = "SPACETIMEDB_HOST",
-        help = "SpacetimeDB server hostname"
+        help = "SpacetimeDB server hostname [default: localhost]"
     )]
-    pub host: String,
+    pub host: Option<String>,
 
-    /// HTTP port of the SpacetimeDB server.
+    // Like `host`, left as `None` when unspecified so the CLI config can be
+    // consulted; otherwise defaults to `3000`.
     #[arg(
         short,
         long,
-        default_value_t = 3000,
         env = "SPACETIMEDB_PORT",
-        help = "SpacetimeDB server port"
+        help = "SpacetimeDB server port [default: 3000]"
     )]
-    pub port: u16,
+    pub port: Option<u16>,
 
     /// Database (module) name to connect to on startup.
     #[arg(
@@ -421,44 +462,33 @@ pub struct Config {
 impl Config {
     /// Build a [`Config`] from parsed CLI arguments.
     ///
-    /// When `--host`/`--port` are at their defaults and/or `--token` is not
-    /// supplied, values are sourced from the SpacetimeDB CLI config
+    /// When no `--host`/`--port`/`--tls` flag is given (and/or `--token` is
+    /// not supplied), values are sourced from the SpacetimeDB CLI config
     /// (`~/.config/spacetime/cli.toml` on every platform) if that file exists.
+    /// Any explicit server flag — even one equal to the built-in default —
+    /// suppresses that fallback; see [`resolve_server`].
     ///
     /// # Errors
     /// Returns an error if the port is 0 or the host is empty.
     pub fn from_cli(cli: Cli) -> Result<Self> {
-        if cli.host.trim().is_empty() {
-            bail!("--host must not be empty");
-        }
-        if cli.port == 0 {
-            bail!("--port must be a non-zero port number");
-        }
-
         // Pull user preferences out of `~/.config/spacetimedb-tui/config.toml`.
         // CLI args override anything we find here, but the user config can
         // supply a default theme and a default database when the CLI didn't.
         let user_cfg = crate::user_config::UserConfig::load();
 
-        // Detect whether the user left host/port at their defaults so we can
-        // transparently apply values from the SpacetimeDB CLI config file.
-        let using_default_server = cli.host == "localhost" && cli.port == 3000 && !cli.tls;
         let cli_cfg = read_spacetime_cli_config();
 
-        // Host / port / TLS: CLI arg takes priority; fall back to CLI config.
-        let (host, port, tls) = if using_default_server {
-            if let Some(ref cc) = cli_cfg {
-                (
-                    cc.host.as_deref().unwrap_or("localhost").to_string(),
-                    cc.port.unwrap_or(3000),
-                    cc.uses_tls,
-                )
-            } else {
-                (cli.host.clone(), cli.port, cli.tls)
-            }
-        } else {
-            (cli.host.clone(), cli.port, cli.tls)
-        };
+        // Host / port / TLS: explicit CLI flags win; otherwise fall back to
+        // the SpacetimeDB CLI config, then to localhost:3000. See
+        // [`resolve_server`] for the precedence rules.
+        let (host, port, tls) = resolve_server(cli.host, cli.port, cli.tls, cli_cfg.as_ref());
+
+        if host.trim().is_empty() {
+            bail!("--host must not be empty");
+        }
+        if port == 0 {
+            bail!("--port must be a non-zero port number");
+        }
 
         // Auth token: explicit `--token` wins, then CLI config, then None.
         let auth_token = cli.token.or_else(|| cli_cfg.and_then(|cc| cc.token));
@@ -532,8 +562,8 @@ mod tests {
 
     fn make_cli(host: &str, port: u16, database: Option<&str>, tls: bool) -> Cli {
         Cli {
-            host: host.to_string(),
-            port,
+            host: Some(host.to_string()),
+            port: Some(port),
             database: database.map(str::to_owned),
             token: None,
             tls,
@@ -566,6 +596,58 @@ mod tests {
     fn test_config_empty_host_is_error() {
         let result = Config::from_cli(make_cli("", 3000, None, false));
         assert!(result.is_err());
+    }
+
+    fn cli_cfg(host: &str, port: u16, tls: bool) -> SpacetimeCliConfig {
+        SpacetimeCliConfig {
+            token: None,
+            host: Some(host.to_string()),
+            port: Some(port),
+            uses_tls: tls,
+        }
+    }
+
+    #[test]
+    fn resolve_server_uses_cli_config_when_no_flags() {
+        // No server flags → fall back to the CLI config (e.g. maincloud).
+        let cc = cli_cfg("maincloud.spacetimedb.com", 443, true);
+        let (h, p, tls) = resolve_server(None, None, false, Some(&cc));
+        assert_eq!(
+            (h.as_str(), p, tls),
+            ("maincloud.spacetimedb.com", 443, true)
+        );
+    }
+
+    #[test]
+    fn resolve_server_explicit_localhost_beats_cli_config() {
+        // The regression: passing the dev defaults explicitly must reach
+        // localhost, NOT be swallowed and replaced by the CLI config.
+        let cc = cli_cfg("maincloud.spacetimedb.com", 443, true);
+        let (h, p, tls) =
+            resolve_server(Some("localhost".to_string()), Some(3000), false, Some(&cc));
+        assert_eq!((h.as_str(), p, tls), ("localhost", 3000, false));
+    }
+
+    #[test]
+    fn resolve_server_partial_host_flag_ignores_cli_config_port() {
+        // Only `--host` given: the CLI config is ignored entirely, and the
+        // port falls back to the built-in 3000 (not the config's port).
+        let cc = cli_cfg("maincloud.spacetimedb.com", 443, true);
+        let (h, p, tls) = resolve_server(Some("10.0.0.5".to_string()), None, false, Some(&cc));
+        assert_eq!((h.as_str(), p, tls), ("10.0.0.5", 3000, false));
+    }
+
+    #[test]
+    fn resolve_server_tls_flag_alone_counts_as_explicit() {
+        let cc = cli_cfg("maincloud.spacetimedb.com", 443, true);
+        let (h, p, tls) = resolve_server(None, None, true, Some(&cc));
+        assert_eq!((h.as_str(), p, tls), ("localhost", 3000, true));
+    }
+
+    #[test]
+    fn resolve_server_defaults_when_no_flags_and_no_config() {
+        let (h, p, tls) = resolve_server(None, None, false, None);
+        assert_eq!((h.as_str(), p, tls), ("localhost", 3000, false));
     }
 
     #[test]

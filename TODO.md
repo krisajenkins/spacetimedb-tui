@@ -12,7 +12,7 @@ The module inspector uses a globe or lock prefix, so let's reuse that.
 - [ ] When I select a database it highlights the first table, but it doesn't load that table's data.
 - [ ] When I scroll through tables it doesn't load the data immediately, because of debouncing. That's good if the data needs fetching, but if it's in cache there's no reason not to show it immediately. Debouncing should only affect remote calls, not UI responsiveness.
 
-# [ ] Host/port flags have stopped working.
+# ☑ Host/port flags have stopped working.
 
 No matter what I pass, it just connects to maincloud.
 
