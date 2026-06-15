@@ -50,6 +50,91 @@ impl QueryResult {
 }
 
 // ---------------------------------------------------------------------------
+// SpacetimeDB special "newtype" types
+// ---------------------------------------------------------------------------
+//
+// SpacetimeDB encodes several primitive-like types (Timestamp, TimeDuration,
+// Identity, …) as single-field product "newtypes" tagged by a magic field
+// name. In the wire format a column's algebraic type therefore looks like
+// `{"Product":{"elements":[{"name":{"some":"__timestamp_micros_since_unix_epoch__"},
+// "algebraic_type":{"I64":[]}}]}}`, and the value arrives as a one-element
+// array (e.g. a Timestamp is `[1780864718837447]`). Without special-casing,
+// the UI shows the raw number or the bare tag `Product`.
+
+/// If `algebraic_type` is a special SpacetimeDB newtype product, return a
+/// friendly label (`"Timestamp"`, `"TimeDuration"`, …); otherwise `None`.
+pub fn special_type_label(algebraic_type: &Value) -> Option<&'static str> {
+    let elements = algebraic_type
+        .get("Product")
+        .and_then(|p| p.get("elements"))
+        .and_then(Value::as_array)?;
+    if elements.len() != 1 {
+        return None;
+    }
+    let name = elements[0].get("name")?;
+    let field = name
+        .get("some")
+        .and_then(Value::as_str)
+        .or_else(|| name.as_str())?;
+    Some(match field {
+        "__timestamp_micros_since_unix_epoch__" => "Timestamp",
+        "__time_duration_micros__" => "TimeDuration",
+        "__identity__" => "Identity",
+        "__connection_id__" => "ConnectionId",
+        _ => return None,
+    })
+}
+
+/// Extract the single integer payload from a SpacetimeDB newtype value.
+///
+/// The SQL/JSON wire format wraps the inner field in a one-element array
+/// (e.g. a Timestamp arrives as `[1780864718837447]`), but a bare number or a
+/// single-field `{magic: n}` object are accepted too.
+pub fn newtype_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Array(a) if a.len() == 1 => a[0].as_i64(),
+        Value::Number(_) => value.as_i64(),
+        Value::Object(o) if o.len() == 1 => o.values().next().and_then(Value::as_i64),
+        _ => None,
+    }
+}
+
+/// Format a micros-since-Unix-epoch timestamp as a readable UTC string.
+pub fn format_timestamp_micros(micros: i64) -> Option<String> {
+    let secs = micros.div_euclid(1_000_000);
+    let nsecs = (micros.rem_euclid(1_000_000) * 1_000) as u32;
+    DateTime::<Utc>::from_timestamp(secs, nsecs)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+}
+
+/// Format a signed micros TimeDuration as a compact `±HhMmS.mmms` string.
+pub fn format_duration_micros(micros: i64) -> String {
+    let sign = if micros < 0 { "-" } else { "" };
+    let total_us = micros.unsigned_abs();
+    let secs = total_us / 1_000_000;
+    let millis = (total_us % 1_000_000) / 1_000;
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{sign}{h}h{m:02}m{s:02}.{millis:03}s")
+    } else if m > 0 {
+        format!("{sign}{m}m{s:02}.{millis:03}s")
+    } else {
+        format!("{sign}{s}.{millis:03}s")
+    }
+}
+
+/// If `algebraic_type` is a special newtype with a renderable value
+/// (Timestamp / TimeDuration), format `value` accordingly. Returns `None` to
+/// fall back to the generic JSON renderer.
+pub fn format_special_value(value: &Value, algebraic_type: &Value) -> Option<String> {
+    match special_type_label(algebraic_type)? {
+        "Timestamp" => newtype_i64(value).and_then(format_timestamp_micros),
+        "TimeDuration" => newtype_i64(value).map(format_duration_micros),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Schema / catalog types
 // ---------------------------------------------------------------------------
 
@@ -285,6 +370,68 @@ impl LogEntry {
             .map(|t| t.format("%H:%M:%S%.3f").to_string())
             .unwrap_or_else(|| "??:??:??".to_string());
         format!("[{}] {} {}", ts, self.level, self.message)
+    }
+}
+
+#[cfg(test)]
+mod special_type_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn timestamp_type() -> Value {
+        json!({"Product": {"elements": [
+            {"name": {"some": "__timestamp_micros_since_unix_epoch__"},
+             "algebraic_type": {"I64": []}}
+        ]}})
+    }
+
+    #[test]
+    fn labels_timestamp_and_friends() {
+        assert_eq!(special_type_label(&timestamp_type()), Some("Timestamp"));
+        let dur = json!({"Product": {"elements": [
+            {"name": {"some": "__time_duration_micros__"}, "algebraic_type": {"I64": []}}
+        ]}});
+        assert_eq!(special_type_label(&dur), Some("TimeDuration"));
+        let ident = json!({"Product": {"elements": [
+            {"name": {"some": "__identity__"}, "algebraic_type": {"U256": []}}
+        ]}});
+        assert_eq!(special_type_label(&ident), Some("Identity"));
+    }
+
+    #[test]
+    fn ignores_plain_and_multi_field_products() {
+        assert_eq!(special_type_label(&json!({"U64": []})), None);
+        let plain = json!({"Product": {"elements": [
+            {"name": {"some": "id"}, "algebraic_type": {"U64": []}},
+            {"name": {"some": "name"}, "algebraic_type": {"String": []}}
+        ]}});
+        assert_eq!(special_type_label(&plain), None);
+    }
+
+    #[test]
+    fn extracts_newtype_payload_from_array() {
+        // The shape the SQL endpoint actually emits.
+        assert_eq!(
+            newtype_i64(&json!([1780864718837447i64])),
+            Some(1780864718837447)
+        );
+        assert_eq!(newtype_i64(&json!(42)), Some(42));
+        assert_eq!(newtype_i64(&json!([1, 2])), None);
+    }
+
+    #[test]
+    fn formats_timestamp_value_via_column_type() {
+        // Real value/type pair pulled from the `booking` table.
+        let out = format_special_value(&json!([1780864718837447i64]), &timestamp_type());
+        assert_eq!(out.as_deref(), Some("2026-06-07 20:38:38 UTC"));
+    }
+
+    #[test]
+    fn formats_durations_compactly() {
+        assert_eq!(format_duration_micros(1_000_000), "1.000s");
+        assert_eq!(format_duration_micros(90_500_000), "1m30.500s");
+        assert_eq!(format_duration_micros(3_661_000_000), "1h01m01.000s");
+        assert_eq!(format_duration_micros(-2_000_000), "-2.000s");
     }
 }
 

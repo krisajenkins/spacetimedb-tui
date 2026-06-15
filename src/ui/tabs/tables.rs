@@ -18,7 +18,7 @@ use ratatui::{
 };
 
 use crate::state::AppState;
-use crate::ui::components::table_grid::{render_empty, TableGrid, TableGridState};
+use crate::ui::components::table_grid::{TableGrid, TableGridState, render_empty};
 
 fn rgb((r, g, b): (u8, u8, u8)) -> Color {
     Color::Rgb(r, g, b)
@@ -238,11 +238,7 @@ fn build_table_data(app: &AppState) -> Option<(Vec<String>, Vec<Vec<String>>, St
     }
 
     let headers: Vec<String> = qr.column_names().iter().map(|s| s.to_string()).collect();
-    let rows: Vec<Vec<String>> = qr
-        .rows
-        .iter()
-        .map(|row| row.iter().map(value_to_display).collect())
-        .collect();
+    let rows: Vec<Vec<String>> = display_rows(qr);
 
     let title = app
         .selected_table()
@@ -250,6 +246,32 @@ fn build_table_data(app: &AppState) -> Option<(Vec<String>, Vec<Vec<String>>, St
         .unwrap_or_else(|| "Results".to_string());
 
     Some((headers, rows, title))
+}
+
+/// Like [`value_to_display`] but aware of the column's algebraic type, so
+/// SpacetimeDB special types (Timestamp, TimeDuration, …) render in
+/// human-readable form instead of as raw JSON.
+pub fn value_to_display_typed(v: &serde_json::Value, col_type: &serde_json::Value) -> String {
+    crate::api::types::format_special_value(v, col_type).unwrap_or_else(|| value_to_display(v))
+}
+
+/// Project every row of a [`QueryResult`](crate::api::types::QueryResult) into
+/// display strings, formatting each cell according to its column's algebraic
+/// type. Used everywhere the rendered rows must agree (grid, sort, search,
+/// copy, export).
+pub fn display_rows(qr: &crate::api::types::QueryResult) -> Vec<Vec<String>> {
+    qr.rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(i, v)| match qr.schema.get(i) {
+                    Some(col) => value_to_display_typed(v, &col.algebraic_type),
+                    None => value_to_display(v),
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Convert a `serde_json::Value` to a compact display string.

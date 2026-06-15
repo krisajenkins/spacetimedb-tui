@@ -21,7 +21,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::api::types::QueryResult;
 
@@ -98,11 +98,7 @@ fn serialise_csv(qr: &QueryResult) -> String {
     write_csv_row(&mut out, headers.iter().copied());
 
     // Data rows
-    for row in &qr.rows {
-        let cells: Vec<String> = row
-            .iter()
-            .map(crate::ui::tabs::tables::value_to_display)
-            .collect();
+    for cells in crate::ui::tabs::tables::display_rows(qr) {
         write_csv_row(&mut out, cells.iter().map(String::as_str));
     }
     out

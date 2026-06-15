@@ -301,6 +301,11 @@ fn render_tables_panel(area: Rect, buf: &mut Buffer, schema: &crate::api::types:
 
 /// Convert an algebraic type JSON value to a compact display string.
 fn type_display(v: &serde_json::Value) -> String {
+    // Timestamp/Identity/… are products tagged by a magic field name; surface
+    // the friendly label rather than the bare `Product` tag.
+    if let Some(label) = crate::api::types::special_type_label(v) {
+        return label.to_string();
+    }
     match v {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Object(o) => {

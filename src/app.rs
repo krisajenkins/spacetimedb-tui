@@ -1350,15 +1350,7 @@ impl App {
         let (qr, grid) = self.active_grid()?;
         // Re-project the rows into the same `Vec<Vec<String>>` that the
         // renderer sorts, then ask `sorted_data_index` for the mapping.
-        let string_rows: Vec<Vec<String>> = qr
-            .rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(crate::ui::tabs::tables::value_to_display)
-                    .collect()
-            })
-            .collect();
+        let string_rows = crate::ui::tabs::tables::display_rows(qr);
         crate::ui::components::table_grid::sorted_data_index(
             &string_rows,
             grid.sort_col,
@@ -1381,15 +1373,7 @@ impl App {
         let Some(sort_col) = grid.sort_col else {
             return Some(data_idx);
         };
-        let string_rows: Vec<Vec<String>> = qr
-            .rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(crate::ui::tabs::tables::value_to_display)
-                    .collect()
-            })
-            .collect();
+        let string_rows = crate::ui::tabs::tables::display_rows(qr);
         // Rebuild the permutation the renderer uses and scan for
         // the display index whose mapped data index matches.
         // O(n²) in the worst case but data grids cap at a few
@@ -1422,7 +1406,12 @@ impl App {
                 Some(v) => v,
                 None => return,
             };
-            crate::ui::tabs::tables::value_to_display(value)
+            match qr.schema.get(grid.selected_col) {
+                Some(col) => {
+                    crate::ui::tabs::tables::value_to_display_typed(value, &col.algebraic_type)
+                }
+                None => crate::ui::tabs::tables::value_to_display(value),
+            }
         };
 
         match crate::ui::clipboard::copy_to_clipboard(&cell_text) {
@@ -1455,7 +1444,13 @@ impl App {
             };
             let tsv = row
                 .iter()
-                .map(crate::ui::tabs::tables::value_to_display)
+                .enumerate()
+                .map(|(i, v)| match qr.schema.get(i) {
+                    Some(col) => {
+                        crate::ui::tabs::tables::value_to_display_typed(v, &col.algebraic_type)
+                    }
+                    None => crate::ui::tabs::tables::value_to_display(v),
+                })
                 .collect::<Vec<_>>()
                 .join("\t");
             (tsv, row.len())
@@ -1497,14 +1492,7 @@ impl App {
             let Some(qr) = qr else {
                 return;
             };
-            qr.rows
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .map(crate::ui::tabs::tables::value_to_display)
-                        .collect()
-                })
-                .collect()
+            crate::ui::tabs::tables::display_rows(qr)
         };
 
         if rows.is_empty() {

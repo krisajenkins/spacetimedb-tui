@@ -18,8 +18,7 @@ use ratatui::{
 
 use crate::state::{AppState, FocusPanel};
 use crate::ui::components::input::{InputState, InputWidget};
-use crate::ui::components::table_grid::{render_empty, TableGrid, TableGridState};
-use crate::ui::tabs::tables::value_to_display;
+use crate::ui::components::table_grid::{TableGrid, TableGridState, render_empty};
 
 fn rgb((r, g, b): (u8, u8, u8)) -> Color {
     Color::Rgb(r, g, b)
@@ -221,11 +220,7 @@ fn render_results(
             }
 
             let headers: Vec<String> = qr.column_names().iter().map(|s| s.to_string()).collect();
-            let rows: Vec<Vec<String>> = qr
-                .rows
-                .iter()
-                .map(|row| row.iter().map(value_to_display).collect())
-                .collect();
+            let rows: Vec<Vec<String>> = crate::ui::tabs::tables::display_rows(qr);
 
             let dur = format_micros(qr.total_duration_micros);
             let base_title = format!("Results — {} rows  ({})", rows.len(), dur);

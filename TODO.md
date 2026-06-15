@@ -1,6 +1,6 @@
-# □ Timestamps show as numbers in the Tables view
+# ☑ Timestamps show as numbers in the Tables view
 
-# □ Timestamps show as 'Product' in the Modules->Tables view
+# ☑ Timestamps show as 'Product' in the Modules->Tables view
 
 # [ ] We want UI feedback in the left panel lift when a table is private
 
