@@ -7,7 +7,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use serde::Deserialize;
 
@@ -16,12 +16,45 @@ use serde::Deserialize;
 // ---------------------------------------------------------------------------
 
 /// Values pulled from the SpacetimeDB CLI config (`spacetime/cli.toml`).
+///
+/// Unlike the connection details (which are a single resolved server),
+/// we keep **all** named servers around so that `-s/--server <nickname>`
+/// can select any of them — not just the file's `default_server`.
 #[derive(Debug, Default)]
 struct SpacetimeCliConfig {
     token: Option<String>,
-    host: Option<String>,
-    port: Option<u16>,
+    /// The file's `default_server` nickname, used when `-s` is not given.
+    default_server: Option<String>,
+    /// Every `[[server_configs]]` entry, resolved to host/port/tls.
+    servers: Vec<ResolvedServer>,
+}
+
+/// A single named server from the CLI config, with its address resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedServer {
+    nickname: String,
+    host: String,
+    port: u16,
     uses_tls: bool,
+}
+
+impl SpacetimeCliConfig {
+    /// Look up a server by its exact nickname.
+    fn server(&self, nickname: &str) -> Option<&ResolvedServer> {
+        self.servers.iter().find(|s| s.nickname == nickname)
+    }
+
+    /// Resolve the server to use when no explicit `-s` is given: the file's
+    /// `default_server`, falling back to the conventional `"local"` nickname.
+    fn default_server(&self) -> Option<&ResolvedServer> {
+        let want = self.default_server.as_deref().unwrap_or("local");
+        self.server(want)
+    }
+
+    /// All known server nicknames, for error messages.
+    fn nicknames(&self) -> Vec<String> {
+        self.servers.iter().map(|s| s.nickname.clone()).collect()
+    }
 }
 
 /// Locate the SpacetimeDB CLI config file.
@@ -98,32 +131,34 @@ struct RawServerConfig {
 fn parse_spacetime_cli_toml(content: &str) -> Option<SpacetimeCliConfig> {
     let raw: RawCliConfig = toml::from_str(content).ok()?;
 
-    // Locate the server matching `default_server` (falling back to "local").
-    let want = raw.default_server.as_deref().unwrap_or("local");
-    let server = raw
+    // Resolve every named server to a concrete (host, port, tls). Entries
+    // missing a nickname or host are skipped — they can't be selected anyway.
+    let servers = raw
         .server_configs
         .iter()
-        .find(|s| s.nickname.as_deref() == Some(want));
-
-    let (host, port, uses_tls) = match server.and_then(|s| s.host.as_deref().map(|h| (s, h))) {
-        Some((s, host_str)) => {
+        .filter_map(|s| {
+            let nickname = s.nickname.clone()?;
+            let host_str = s.host.as_deref()?;
             let is_https = s.protocol.as_deref() == Some("https");
             // When the host carries no explicit port, fall back to the
             // protocol's standard port (443 for https, 80 for http) rather
             // than the local-dev default of 3000. maincloud, for example, is
             // `maincloud.spacetimedb.com` over https → 443, not 3000.
             let default_port = if is_https { 443 } else { 80 };
-            let (h, p) = split_host_port(host_str, default_port);
-            (Some(h), Some(p), is_https)
-        }
-        None => (None, None, false),
-    };
+            let (host, port) = split_host_port(host_str, default_port);
+            Some(ResolvedServer {
+                nickname,
+                host,
+                port,
+                uses_tls: is_https,
+            })
+        })
+        .collect();
 
     Some(SpacetimeCliConfig {
         token: raw.spacetimedb_token,
-        host,
-        port,
-        uses_tls,
+        default_server: raw.default_server,
+        servers,
     })
 }
 
@@ -154,40 +189,69 @@ fn split_host_port(addr: &str, default_port: u16) -> (String, u16) {
 /// Resolve the `(host, port, tls)` to connect to from the CLI flags and the
 /// optional SpacetimeDB CLI config.
 ///
-/// The user is considered to have **explicitly chosen a server** when they
-/// pass any of `--host`, `--port`, or `--tls` (on the command line or via the
-/// matching env var). In that case the CLI config is ignored entirely — even
-/// if the values happen to equal the built-in defaults — so that
-/// `-H localhost -p 3000` always reaches a local server rather than being
-/// silently replaced by the CLI config's `default_server`.
+/// Precedence, highest first:
 ///
-/// Only when *no* server flag is given do we fall back to the CLI config, and
-/// finally to `localhost:3000` without TLS.
+/// 1. **Explicit `--host`/`--port`/`--tls`.** Passing any of these means the
+///    user picked a server by hand; the CLI config is ignored entirely — even
+///    if the values happen to equal the built-in defaults — so that
+///    `-H localhost -p 3000` always reaches a local server rather than being
+///    silently replaced by the config's `default_server`. (These conflict with
+///    `-s` at the clap layer, so they never co-occur.)
+/// 2. **`-s/--server <nickname>`.** Looks the nickname up in the CLI config's
+///    `server_configs` and uses that server's host/port/protocol. An unknown
+///    nickname (or a missing config file) is an error, not a silent fallback.
+/// 3. **The config's `default_server`**, when no server flag is given at all.
+/// 4. **`localhost:3000` without TLS**, when there is no config to consult.
 fn resolve_server(
     cli_host: Option<String>,
     cli_port: Option<u16>,
     cli_tls: bool,
+    cli_server: Option<&str>,
     cli_cfg: Option<&SpacetimeCliConfig>,
-) -> (String, u16, bool) {
+) -> Result<(String, u16, bool)> {
     // `--tls` is a `SetTrue` flag, so `false` is indistinguishable from unset;
     // treat `true` as an explicit server choice, `false` as "not specified".
-    let server_explicit = cli_host.is_some() || cli_port.is_some() || cli_tls;
+    let host_port_tls_explicit = cli_host.is_some() || cli_port.is_some() || cli_tls;
 
-    if !server_explicit {
-        if let Some(cc) = cli_cfg {
-            return (
-                cc.host.clone().unwrap_or_else(|| "localhost".to_string()),
-                cc.port.unwrap_or(3000),
-                cc.uses_tls,
-            );
+    if host_port_tls_explicit {
+        return Ok((
+            cli_host.unwrap_or_else(|| "localhost".to_string()),
+            cli_port.unwrap_or(3000),
+            cli_tls,
+        ));
+    }
+
+    // `-s/--server <nickname>`: resolve it against the CLI config. Unlike the
+    // default-server fallback below, a bad `-s` is a hard error so the user
+    // isn't silently connected to the wrong place.
+    if let Some(name) = cli_server {
+        let cfg = cli_cfg.ok_or_else(|| {
+            anyhow!(
+                "--server {name:?} was given, but no SpacetimeDB CLI config \
+                 (~/.config/spacetime/cli.toml) was found to resolve it against"
+            )
+        })?;
+        let server = cfg.server(name).ok_or_else(|| {
+            let available = cfg.nicknames();
+            let listed = if available.is_empty() {
+                "(none configured)".to_string()
+            } else {
+                available.join(", ")
+            };
+            anyhow!("--server {name:?} not found in cli.toml; available servers: {listed}")
+        })?;
+        return Ok((server.host.clone(), server.port, server.uses_tls));
+    }
+
+    // No server flags → fall back to the config's default server, then
+    // finally to the local-dev default.
+    if let Some(cc) = cli_cfg {
+        if let Some(server) = cc.default_server() {
+            return Ok((server.host.clone(), server.port, server.uses_tls));
         }
     }
 
-    (
-        cli_host.unwrap_or_else(|| "localhost".to_string()),
-        cli_port.unwrap_or(3000),
-        cli_tls,
-    )
+    Ok(("localhost".to_string(), 3000, false))
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +289,19 @@ pub struct Cli {
         help = "SpacetimeDB server port [default: 3000]"
     )]
     pub port: Option<u16>,
+
+    /// Named server from the SpacetimeDB CLI config (e.g. `-slocal`,
+    /// `-smaincloud`). A shortcut that pulls host/port/TLS from the matching
+    /// `[[server_configs]]` entry in `~/.config/spacetime/cli.toml`. Mutually
+    /// exclusive with `--host`/`--port`/`--tls`, which set those by hand.
+    #[arg(
+        short,
+        long,
+        env = "SPACETIMEDB_SERVER",
+        conflicts_with_all = ["host", "port", "tls"],
+        help = "Named server from the spacetime CLI config (e.g. local, maincloud)"
+    )]
+    pub server: Option<String>,
 
     /// Database (module) name to connect to on startup.
     #[arg(
@@ -478,10 +555,16 @@ impl Config {
 
         let cli_cfg = read_spacetime_cli_config();
 
-        // Host / port / TLS: explicit CLI flags win; otherwise fall back to
-        // the SpacetimeDB CLI config, then to localhost:3000. See
+        // Host / port / TLS: explicit CLI flags win; then a `-s` nickname; then
+        // the SpacetimeDB CLI config's default server; then localhost:3000. See
         // [`resolve_server`] for the precedence rules.
-        let (host, port, tls) = resolve_server(cli.host, cli.port, cli.tls, cli_cfg.as_ref());
+        let (host, port, tls) = resolve_server(
+            cli.host,
+            cli.port,
+            cli.tls,
+            cli.server.as_deref(),
+            cli_cfg.as_ref(),
+        )?;
 
         if host.trim().is_empty() {
             bail!("--host must not be empty");
@@ -491,7 +574,9 @@ impl Config {
         }
 
         // Auth token: explicit `--token` wins, then CLI config, then None.
-        let auth_token = cli.token.or_else(|| cli_cfg.and_then(|cc| cc.token));
+        let auth_token = cli
+            .token
+            .or_else(|| cli_cfg.as_ref().and_then(|cc| cc.token.clone()));
 
         let scheme = if tls { "https" } else { "http" };
         let ws_scheme = if tls { "wss" } else { "ws" };
@@ -564,6 +649,7 @@ mod tests {
         Cli {
             host: Some(host.to_string()),
             port: Some(port),
+            server: None,
             database: database.map(str::to_owned),
             token: None,
             tls,
@@ -598,20 +684,29 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn cli_cfg(host: &str, port: u16, tls: bool) -> SpacetimeCliConfig {
+    fn server(nickname: &str, host: &str, port: u16, tls: bool) -> ResolvedServer {
+        ResolvedServer {
+            nickname: nickname.to_string(),
+            host: host.to_string(),
+            port,
+            uses_tls: tls,
+        }
+    }
+
+    /// A config whose `default_server` points at a single named server.
+    fn cli_cfg(nickname: &str, host: &str, port: u16, tls: bool) -> SpacetimeCliConfig {
         SpacetimeCliConfig {
             token: None,
-            host: Some(host.to_string()),
-            port: Some(port),
-            uses_tls: tls,
+            default_server: Some(nickname.to_string()),
+            servers: vec![server(nickname, host, port, tls)],
         }
     }
 
     #[test]
     fn resolve_server_uses_cli_config_when_no_flags() {
-        // No server flags → fall back to the CLI config (e.g. maincloud).
-        let cc = cli_cfg("maincloud.spacetimedb.com", 443, true);
-        let (h, p, tls) = resolve_server(None, None, false, Some(&cc));
+        // No server flags → fall back to the CLI config's default (e.g. maincloud).
+        let cc = cli_cfg("maincloud", "maincloud.spacetimedb.com", 443, true);
+        let (h, p, tls) = resolve_server(None, None, false, None, Some(&cc)).unwrap();
         assert_eq!(
             (h.as_str(), p, tls),
             ("maincloud.spacetimedb.com", 443, true)
@@ -622,9 +717,15 @@ mod tests {
     fn resolve_server_explicit_localhost_beats_cli_config() {
         // The regression: passing the dev defaults explicitly must reach
         // localhost, NOT be swallowed and replaced by the CLI config.
-        let cc = cli_cfg("maincloud.spacetimedb.com", 443, true);
-        let (h, p, tls) =
-            resolve_server(Some("localhost".to_string()), Some(3000), false, Some(&cc));
+        let cc = cli_cfg("maincloud", "maincloud.spacetimedb.com", 443, true);
+        let (h, p, tls) = resolve_server(
+            Some("localhost".to_string()),
+            Some(3000),
+            false,
+            None,
+            Some(&cc),
+        )
+        .unwrap();
         assert_eq!((h.as_str(), p, tls), ("localhost", 3000, false));
     }
 
@@ -632,22 +733,56 @@ mod tests {
     fn resolve_server_partial_host_flag_ignores_cli_config_port() {
         // Only `--host` given: the CLI config is ignored entirely, and the
         // port falls back to the built-in 3000 (not the config's port).
-        let cc = cli_cfg("maincloud.spacetimedb.com", 443, true);
-        let (h, p, tls) = resolve_server(Some("10.0.0.5".to_string()), None, false, Some(&cc));
+        let cc = cli_cfg("maincloud", "maincloud.spacetimedb.com", 443, true);
+        let (h, p, tls) =
+            resolve_server(Some("10.0.0.5".to_string()), None, false, None, Some(&cc)).unwrap();
         assert_eq!((h.as_str(), p, tls), ("10.0.0.5", 3000, false));
     }
 
     #[test]
     fn resolve_server_tls_flag_alone_counts_as_explicit() {
-        let cc = cli_cfg("maincloud.spacetimedb.com", 443, true);
-        let (h, p, tls) = resolve_server(None, None, true, Some(&cc));
+        let cc = cli_cfg("maincloud", "maincloud.spacetimedb.com", 443, true);
+        let (h, p, tls) = resolve_server(None, None, true, None, Some(&cc)).unwrap();
         assert_eq!((h.as_str(), p, tls), ("localhost", 3000, true));
     }
 
     #[test]
     fn resolve_server_defaults_when_no_flags_and_no_config() {
-        let (h, p, tls) = resolve_server(None, None, false, None);
+        let (h, p, tls) = resolve_server(None, None, false, None, None).unwrap();
         assert_eq!((h.as_str(), p, tls), ("localhost", 3000, false));
+    }
+
+    #[test]
+    fn resolve_server_named_flag_selects_non_default_server() {
+        // `-s local` picks `local` even though `default_server` is maincloud.
+        let cc = SpacetimeCliConfig {
+            token: None,
+            default_server: Some("maincloud".to_string()),
+            servers: vec![
+                server("maincloud", "maincloud.spacetimedb.com", 443, true),
+                server("local", "127.0.0.1", 3000, false),
+            ],
+        };
+        let (h, p, tls) = resolve_server(None, None, false, Some("local"), Some(&cc)).unwrap();
+        assert_eq!((h.as_str(), p, tls), ("127.0.0.1", 3000, false));
+    }
+
+    #[test]
+    fn resolve_server_named_flag_unknown_nickname_errors() {
+        let cc = cli_cfg("local", "127.0.0.1", 3000, false);
+        let err = resolve_server(None, None, false, Some("nope"), Some(&cc)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nope"), "message was: {msg}");
+        assert!(
+            msg.contains("local"),
+            "should list available servers: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_server_named_flag_without_config_errors() {
+        let err = resolve_server(None, None, false, Some("local"), None).unwrap_err();
+        assert!(err.to_string().contains("no SpacetimeDB CLI config"));
     }
 
     #[test]
@@ -746,11 +881,12 @@ mod tests {
         "#;
         let cfg = parse_spacetime_cli_toml(toml).unwrap();
         assert_eq!(cfg.token.as_deref(), Some("tok123"));
-        assert_eq!(cfg.host.as_deref(), Some("maincloud.spacetimedb.com"));
+        let s = cfg.default_server().unwrap();
+        assert_eq!(s.host, "maincloud.spacetimedb.com");
         // No port in the host string → falls back to the protocol default
         // (https → 443), NOT the local-dev 3000.
-        assert_eq!(cfg.port, Some(443));
-        assert!(cfg.uses_tls);
+        assert_eq!(s.port, 443);
+        assert!(s.uses_tls);
     }
 
     #[test]
@@ -765,9 +901,10 @@ mod tests {
             protocol = "http"
         "#;
         let cfg = parse_spacetime_cli_toml(toml).unwrap();
-        assert_eq!(cfg.host.as_deref(), Some("127.0.0.1"));
-        assert_eq!(cfg.port, Some(3000));
-        assert!(!cfg.uses_tls);
+        let s = cfg.default_server().unwrap();
+        assert_eq!(s.host, "127.0.0.1");
+        assert_eq!(s.port, 3000);
+        assert!(!s.uses_tls);
     }
 
     #[test]
@@ -781,9 +918,10 @@ mod tests {
             protocol = "http"
         "#;
         let cfg = parse_spacetime_cli_toml(toml).unwrap();
-        assert_eq!(cfg.host.as_deref(), Some("example.com"));
-        assert_eq!(cfg.port, Some(80));
-        assert!(!cfg.uses_tls);
+        let s = cfg.default_server().unwrap();
+        assert_eq!(s.host, "example.com");
+        assert_eq!(s.port, 80);
+        assert!(!s.uses_tls);
     }
 
     #[test]
@@ -797,8 +935,9 @@ mod tests {
             protocol = "https"
         "#;
         let cfg = parse_spacetime_cli_toml(toml).unwrap();
-        assert_eq!(cfg.port, Some(8443));
-        assert!(cfg.uses_tls);
+        let s = cfg.default_server().unwrap();
+        assert_eq!(s.port, 8443);
+        assert!(s.uses_tls);
     }
 
     #[test]
@@ -814,8 +953,37 @@ mod tests {
         "#;
         let cfg = parse_spacetime_cli_toml(toml).unwrap();
         assert_eq!(cfg.token.as_deref(), Some("tok123"));
-        assert!(cfg.host.is_none());
-        assert!(cfg.port.is_none());
+        // `default_server = "missing"` has no matching entry, so resolution
+        // yields nothing — but the token is still read from the top level.
+        assert!(cfg.default_server().is_none());
+    }
+
+    #[test]
+    fn parse_cli_toml_keeps_all_servers_for_nickname_lookup() {
+        // Every named server is retained so `-s <nickname>` can pick any of
+        // them, not just `default_server`.
+        let toml = r#"
+            default_server = "maincloud"
+
+            [[server_configs]]
+            nickname = "maincloud"
+            host = "maincloud.spacetimedb.com"
+            protocol = "https"
+
+            [[server_configs]]
+            nickname = "local"
+            host = "127.0.0.1:3000"
+            protocol = "http"
+        "#;
+        let cfg = parse_spacetime_cli_toml(toml).unwrap();
+        assert_eq!(cfg.nicknames(), vec!["maincloud", "local"]);
+        let local = cfg.server("local").unwrap();
+        assert_eq!(
+            (local.host.as_str(), local.port, local.uses_tls),
+            ("127.0.0.1", 3000, false)
+        );
+        // The default resolves to maincloud.
+        assert_eq!(cfg.default_server().unwrap().nickname, "maincloud");
     }
 
     #[test]

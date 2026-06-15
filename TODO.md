@@ -16,6 +16,15 @@ The module inspector uses a globe or lock prefix, so let's reuse that.
 
 No matter what I pass, it just connects to maincloud.
 
-# [ ] `-s/--server` flag support.
+# ☑ `-s/--server` flag support.
 
 The official `spacetime` CLI tool supports a flag that lets you say `-slocal` or `-smaincloud` as a shortcut to the right host/port/tls setting. That's really helpful. Let's do that too.
+
+# [ ] We should show views
+
+Both in the table browser, and the module browser. Shown with an 👁️ icon?
+
+# [ ] `-d/--database` doesn't work very well.
+
+If the supplied database doesn't exist, it shows up as the selection in the GUI, but the first data load obviously fails.
+If it _does_ exist it doesn't get selected, so the flag was pointless.
