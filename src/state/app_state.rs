@@ -437,6 +437,11 @@ pub struct AppState {
     // ------------------------------------------------------------------
     /// Cached query results keyed by `"<database>.<table_name>"`.
     pub table_cache: HashMap<String, TableCache>,
+    /// Cached schemas keyed by database name, so switching back to a
+    /// previously visited database shows its tables instantly instead of
+    /// re-fetching. Session-lifetime, no TTL — mirrors `table_cache`; an
+    /// explicit refresh (`r`) bypasses it.
+    pub schema_cache: HashMap<String, Schema>,
 
     // ------------------------------------------------------------------
     // Log buffer
@@ -554,6 +559,7 @@ impl AppState {
             history_cursor: None,
 
             table_cache: HashMap::new(),
+            schema_cache: HashMap::new(),
 
             log_buffer: VecDeque::new(),
             log_scroll: 0,
@@ -845,6 +851,17 @@ impl AppState {
             .filter(|c| c.fetched_at.elapsed() <= max_age)
     }
 
+    /// Store a database's schema in the session schema cache.
+    pub fn cache_schema(&mut self, database: &str, schema: Schema) {
+        self.schema_cache.insert(database.to_string(), schema);
+    }
+
+    /// Retrieve a cached schema for `database`, if one has been loaded
+    /// this session.
+    pub fn get_cached_schema(&self, database: &str) -> Option<&Schema> {
+        self.schema_cache.get(database)
+    }
+
     // ------------------------------------------------------------------
     // Uptime
     // ------------------------------------------------------------------
@@ -1050,5 +1067,22 @@ mod tests {
         // Simulate expiry by using a zero TTL.
         s.tick_notifications(Duration::ZERO);
         assert!(s.notification.is_none());
+    }
+
+    #[test]
+    fn test_schema_cache_round_trip() {
+        let mut s = make_state();
+        let schema = Schema {
+            typespace: serde_json::Value::Null,
+            tables: Vec::new(),
+            reducers: Vec::new(),
+        };
+
+        // Miss before anything is cached; keyed per-database.
+        assert!(s.get_cached_schema("alpha").is_none());
+
+        s.cache_schema("alpha", schema);
+        assert!(s.get_cached_schema("alpha").is_some());
+        assert!(s.get_cached_schema("beta").is_none());
     }
 }

@@ -1083,7 +1083,7 @@ impl App {
                     let old = self.state.selected_database_idx;
                     self.state.database_next();
                     if self.state.selected_database_idx != old {
-                        self.load_schema().await;
+                        self.load_schema_cached().await;
                     }
                 }
                 SidebarFocus::Tables => {
@@ -1140,7 +1140,11 @@ impl App {
         match self.state.focus {
             FocusPanel::Sidebar => match self.state.sidebar_focus {
                 SidebarFocus::Databases => {
+                    let old = self.state.selected_database_idx;
                     self.state.database_prev();
+                    if self.state.selected_database_idx != old {
+                        self.load_schema_cached().await;
+                    }
                 }
                 SidebarFocus::Tables => {
                     self.select_table_delta(false).await;
@@ -1184,10 +1188,21 @@ impl App {
         if self.state.selected_table_idx != old {
             self.state.current_tab = Tab::Tables;
             self.tables_grid = TableGridState::new();
-            // Defer the fetch: the event loop fires it once the selection
-            // has been still for `TABLE_LOAD_DEBOUNCE`, so holding j/k
-            // doesn't issue a query for every table scrolled past.
-            self.pending_table_load = Some(Instant::now());
+            if self.try_show_cached_table() {
+                // Cache hit: show it instantly. Debouncing should only gate
+                // remote calls, not UI responsiveness — so cancel any
+                // pending fetch and don't arm a new one.
+                self.pending_table_load = None;
+            } else {
+                // Cache miss: clear the previous table's rows so the grid
+                // shows a loading state rather than stale data, then defer
+                // the fetch — the event loop fires it once the selection
+                // has been still for `TABLE_LOAD_DEBOUNCE`, so holding j/k
+                // doesn't issue a query for every table scrolled past.
+                self.state.table_browse_result = None;
+                self.state.query_loading = true;
+                self.pending_table_load = Some(Instant::now());
+            }
         }
     }
 
@@ -1340,6 +1355,72 @@ impl App {
         });
     }
 
+    /// Load the selected database's schema, preferring the session cache.
+    ///
+    /// Mirrors [`load_table_data_cached`]: a previously visited database is
+    /// applied instantly with no network request, so switching back and
+    /// forth between databases doesn't re-fetch. An explicit refresh (`r`,
+    /// which calls [`load_schema`] directly) bypasses the cache.
+    async fn load_schema_cached(&mut self) {
+        let db = match self.state.selected_database() {
+            Some(d) => d.to_string(),
+            None => return,
+        };
+        if let Some(schema) = self.state.get_cached_schema(&db).cloned() {
+            self.on_schema_loaded(schema).await;
+        } else {
+            self.load_schema().await;
+        }
+    }
+
+    /// Apply a loaded schema to the UI state and kick off dependent loads.
+    ///
+    /// Shared by the HTTP fetch path ([`AppEvent::SchemaLoaded`]) and the
+    /// cache-hit path ([`load_schema_cached`]) so both behave identically:
+    /// the schema is cached, the table list and selection are populated,
+    /// the highlighted table's data is loaded, and the live-data WebSocket
+    /// subscription is (re)established.
+    async fn on_schema_loaded(&mut self, schema: crate::api::types::Schema) {
+        self.state.schema_loading = false;
+        self.state.schema_load_failed = false;
+        // The schema is available, so this database is responding —
+        // clear any stale paused flag and remember the schema so a later
+        // return to this database is instant.
+        if let Some(name) = self.state.selected_database().map(str::to_string) {
+            self.state
+                .set_database_status(&name, crate::state::DatabaseStatus::Active);
+            self.state.cache_schema(&name, schema.clone());
+        }
+        self.state.tables = schema.tables.clone();
+        // If we restored a session and the user was looking at
+        // a specific table, jump to it instead of defaulting
+        // to row 0.
+        if !self.state.tables.is_empty() && self.state.selected_table_idx.is_none() {
+            let restored = self
+                .pending_session
+                .as_ref()
+                .and_then(|s| s.last_table.as_deref())
+                .and_then(|name| self.state.tables.iter().position(|t| t.table_name == name));
+            self.state.selected_table_idx = Some(restored.unwrap_or(0));
+        }
+        // Session restore is one-shot — don't keep firing it
+        // every time the user navigates to a new database.
+        self.pending_session = None;
+        self.state.current_schema = Some(schema);
+        let table_count = self.state.tables.len();
+        send_event(
+            &self.event_tx,
+            AppEvent::Notification(format!("Schema loaded — {table_count} tables")),
+        );
+        // Selecting a database should show data, not an empty grid: load
+        // the highlighted table's rows (from cache when possible).
+        if self.state.selected_table_idx.is_some() {
+            self.load_table_data_cached().await;
+        }
+        // Establish WebSocket subscription for live data
+        self.connect_ws().await;
+    }
+
     async fn load_table_data(&mut self) {
         let db = match self.state.selected_database() {
             Some(d) => d.to_string(),
@@ -1390,24 +1471,36 @@ impl App {
     /// table is instant and issues no query. Only an explicit refresh
     /// (`r`, which calls [`load_table_data`] directly) refetches.
     async fn load_table_data_cached(&mut self) {
-        let key = match (self.state.selected_database(), self.state.selected_table()) {
-            (Some(db), Some(t)) => Some((db.to_string(), t.table_name.clone())),
-            _ => None,
-        };
-        if let Some((db, table)) = key {
-            // `Duration::MAX` → cache-until-explicit-refresh (no TTL).
-            let cached = self
-                .state
-                .get_cached_table(&db, &table, Duration::MAX)
-                .map(|c| c.result.clone());
-            if let Some(result) = cached {
-                self.state.query_loading = false;
-                self.state.table_browse_result = Some(result);
-                self.tables_grid = TableGridState::new();
-                return;
-            }
+        if !self.try_show_cached_table() {
+            self.load_table_data().await;
         }
-        self.load_table_data().await;
+    }
+
+    /// Show the selected table's data from the session cache, if present.
+    ///
+    /// Returns `true` on a cache hit (data shown, no network request),
+    /// `false` otherwise. Pure and synchronous so callers can decide
+    /// instantly whether a remote fetch is needed — this is what lets the
+    /// sidebar render cached tables immediately while still debouncing the
+    /// fetch for uncached ones.
+    fn try_show_cached_table(&mut self) -> bool {
+        let key = match (self.state.selected_database(), self.state.selected_table()) {
+            (Some(db), Some(t)) => (db.to_string(), t.table_name.clone()),
+            _ => return false,
+        };
+        // `Duration::MAX` → cache-until-explicit-refresh (no TTL).
+        let cached = self
+            .state
+            .get_cached_table(&key.0, &key.1, Duration::MAX)
+            .map(|c| c.result.clone());
+        if let Some(result) = cached {
+            self.state.query_loading = false;
+            self.state.table_browse_result = Some(result);
+            self.tables_grid = TableGridState::new();
+            true
+        } else {
+            false
+        }
     }
 
     /// Return a reference to the `QueryResult` / `TableGridState` pair
@@ -3287,39 +3380,7 @@ impl App {
             }
 
             AppEvent::SchemaLoaded(schema) => {
-                self.state.schema_loading = false;
-                self.state.schema_load_failed = false;
-                // The schema came back, so this database is responding —
-                // clear any stale paused flag.
-                if let Some(name) = self.state.selected_database().map(str::to_string) {
-                    self.state
-                        .set_database_status(&name, crate::state::DatabaseStatus::Active);
-                }
-                self.state.tables = schema.tables.clone();
-                // If we restored a session and the user was looking at
-                // a specific table, jump to it instead of defaulting
-                // to row 0.
-                if !self.state.tables.is_empty() && self.state.selected_table_idx.is_none() {
-                    let restored = self
-                        .pending_session
-                        .as_ref()
-                        .and_then(|s| s.last_table.as_deref())
-                        .and_then(|name| {
-                            self.state.tables.iter().position(|t| t.table_name == name)
-                        });
-                    self.state.selected_table_idx = Some(restored.unwrap_or(0));
-                }
-                // Session restore is one-shot — don't keep firing it
-                // every time the user navigates to a new database.
-                self.pending_session = None;
-                self.state.current_schema = Some(schema);
-                let table_count = self.state.tables.len();
-                send_event(
-                    &self.event_tx,
-                    AppEvent::Notification(format!("Schema loaded — {table_count} tables")),
-                );
-                // Establish WebSocket subscription for live data
-                self.connect_ws().await;
+                self.on_schema_loaded(schema).await;
             }
 
             AppEvent::SchemaError(msg) => {
