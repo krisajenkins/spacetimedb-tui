@@ -9,10 +9,11 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
-    connect_async,
+    connect_async_with_config,
     tungstenite::{
-        handshake::client::{generate_key, Request},
         Error as TungError, Message,
+        handshake::client::{Request, generate_key},
+        protocol::WebSocketConfig,
     },
 };
 use tracing::{debug, error, info, warn};
@@ -278,6 +279,21 @@ enum ConnectOutcome {
 const RECONNECT_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const RECONNECT_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// WebSocket protocol limits for SpacetimeDB connections.
+///
+/// tungstenite defaults to a 64 MiB max message size and a 16 MiB max frame
+/// size. A subscription's *initial* update is a full snapshot of every
+/// matched table, which routinely blows past those caps on a busy database —
+/// tungstenite then surfaces it as `Error::Capacity` ("Space limit exceeded:
+/// Message too long"), kills the frame, and the reconnect churn corrupts the
+/// TUI render. We're reading from a database the user already trusts, so we
+/// lift both caps entirely (`None`) and let the snapshot through.
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(None)
+        .max_frame_size(None)
+}
+
 /// Main loop for a subscription WebSocket connection — wraps a single-attempt
 /// connection in an exponential-backoff retry loop. The retry loop exits only
 /// when the consumer drops the event channel or sends `WsCommand::Close`.
@@ -362,7 +378,7 @@ async fn connect_subscription_once(
         Err(e) => return ConnectOutcome::Lost(format!("Request build error: {e}")),
     };
 
-    let (ws_stream, _) = match connect_async(request).await {
+    let (ws_stream, _) = match connect_async_with_config(request, Some(ws_config()), false).await {
         Ok(pair) => pair,
         Err(e) => {
             // Classify the handshake failure. A server-side HTTP error
@@ -493,7 +509,7 @@ async fn log_follow_task(
         }
     };
 
-    let (ws_stream, _) = match connect_async(request).await {
+    let (ws_stream, _) = match connect_async_with_config(request, Some(ws_config()), false).await {
         Ok(pair) => pair,
         Err(e) => {
             error!("Log WebSocket connect failed: {e}");
