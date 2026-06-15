@@ -250,7 +250,15 @@ fn build_items(app: &AppState) -> Vec<TreeItem> {
                     let branch = if is_last { "└──" } else { "├──" };
                     let is_selected_tbl = app.selected_table_idx == Some(ti);
                     let marker = if is_selected_tbl { "▸ " } else { "  " };
-                    let label = format!("      {branch} {marker}{}", table.table_name);
+                    // Reuse the module inspector's access glyphs so a private
+                    // table reads the same way in both views.
+                    let access_icon = if table.table_access == "private" {
+                        "🔒"
+                    } else {
+                        "🌐"
+                    };
+                    let label =
+                        format!("      {branch} {marker}{access_icon} {}", table.table_name);
 
                     items.push(TreeItem {
                         label,
@@ -321,5 +329,44 @@ mod tests {
 
         assert!(!active.label.contains("paused"));
         assert!(paused.label.contains("⏸ paused"));
+    }
+
+    #[test]
+    fn table_rows_flag_private_vs_public_access() {
+        use crate::api::types::TableInfo;
+
+        let table = |name: &str, access: &str| TableInfo {
+            table_name: name.to_string(),
+            product_type_ref: 0,
+            table_type: "user".to_string(),
+            table_access: access.to_string(),
+            columns: Vec::new(),
+            primary_key_cols: Vec::new(),
+            indexes: Vec::new(),
+            constraints: Vec::new(),
+        };
+
+        let mut app = AppState::new("http://localhost:3000");
+        app.databases = vec![Database::new("db")];
+        app.selected_database_idx = Some(0);
+        app.tables = vec![
+            table("public_tbl", "public"),
+            table("secret_tbl", "private"),
+        ];
+
+        let items = build_items(&app);
+        let public = items
+            .iter()
+            .find(|i| i.label.contains("public_tbl"))
+            .unwrap();
+        let private = items
+            .iter()
+            .find(|i| i.label.contains("secret_tbl"))
+            .unwrap();
+
+        assert!(public.label.contains('🌐'));
+        assert!(!public.label.contains('🔒'));
+        assert!(private.label.contains('🔒'));
+        assert!(!private.label.contains('🌐'));
     }
 }

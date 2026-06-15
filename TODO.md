@@ -2,7 +2,7 @@
 
 # ☑ Timestamps show as 'Product' in the Modules->Tables view
 
-# [ ] We want UI feedback in the left panel lift when a table is private
+# ☑ We want UI feedback in the left panel lift when a table is private
 
 The module inspector uses a globe or lock prefix, so let's reuse that.
 
