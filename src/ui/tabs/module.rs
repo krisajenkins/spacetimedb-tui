@@ -236,7 +236,9 @@ fn render_tables_panel(area: Rect, buf: &mut Buffer, schema: &crate::api::types:
         let access_icon = if tbl.table_access == "private" {
             "🔒"
         } else {
-            "🌐"
+            // Earth-Africa globe (🌍) renders more consistently at width 2
+            // than the meridian globe (🌐) in many terminal fonts.
+            "🌍"
         };
         let line = Line::from(vec![
             Span::styled(

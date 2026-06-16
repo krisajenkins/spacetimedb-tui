@@ -260,7 +260,9 @@ fn build_items(app: &AppState) -> Vec<TreeItem> {
                     } else if table.table_access == "private" {
                         "🔒"
                     } else {
-                        "🌐"
+                        // Earth-Africa globe renders more consistently at
+                        // width 2 than the meridian globe (🌐) in many fonts.
+                        "🌍"
                     };
                     let label = format!("      {branch} {marker}{icon} {}", table.table_name);
 
@@ -369,10 +371,10 @@ mod tests {
             .find(|i| i.label.contains("secret_tbl"))
             .unwrap();
 
-        assert!(public.label.contains('🌐'));
+        assert!(public.label.contains('🌍'));
         assert!(!public.label.contains('🔒'));
         assert!(private.label.contains('🔒'));
-        assert!(!private.label.contains('🌐'));
+        assert!(!private.label.contains('🌍'));
     }
 
     #[test]
@@ -404,7 +406,7 @@ mod tests {
 
         // A view reads as 👁, never the table public/private glyphs.
         assert!(row.label.contains('👁'));
-        assert!(!row.label.contains('🌐'));
+        assert!(!row.label.contains('🌍'));
         assert!(!row.label.contains('🔒'));
     }
 }
