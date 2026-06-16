@@ -38,10 +38,13 @@ pub enum WsEvent {
     RawText(String),
     /// The WebSocket connection was successfully established.
     Connected,
-    /// The connection was closed (gracefully or by error). The task will
-    /// transition to a `Reconnecting` state automatically unless `final_close`
-    /// is `true`, in which case the task is shutting down for good.
-    Disconnected { reason: String },
+    /// The connection was closed. The task will transition to a
+    /// `Reconnecting` state automatically unless the reason carries the
+    /// `(retries disabled)` marker, in which case it is shutting down for
+    /// good. `graceful` is `true` when the server closed the connection
+    /// cleanly with a Close frame — the expected behaviour when a module is
+    /// republished — as opposed to an abrupt drop or socket error.
+    Disconnected { reason: String, graceful: bool },
     /// The task is waiting `delay_ms` before its next reconnect attempt.
     /// `attempt` is 1-indexed.
     Reconnecting { attempt: u32, delay_ms: u64 },
@@ -267,8 +270,10 @@ enum ConnectOutcome {
     Closed,
     /// The connection was lost transiently; the outer loop should sleep
     /// with backoff and try again (e.g. the server was restarted, the
-    /// stream timed out, a socket-level error fired).
-    Lost(String),
+    /// stream timed out, a socket-level error fired). `graceful` is `true`
+    /// when the server closed cleanly with a Close frame (the normal
+    /// republish path) rather than dropping unexpectedly.
+    Lost { reason: String, graceful: bool },
     /// The connection failed with a permanent server-side error such as
     /// HTTP 401 / 403 / 404 / 5xx. Retrying won't help and would just
     /// spam the log, so the outer loop should exit immediately with a
@@ -332,15 +337,31 @@ async fn subscription_task(
                 let _ = event_tx
                     .send(WsEvent::Disconnected {
                         reason: format!("{reason} (retries disabled)"),
+                        graceful: false,
                     })
                     .await;
                 return;
             }
-            ConnectOutcome::Lost(reason) => {
-                let _ = event_tx.send(WsEvent::Disconnected { reason }).await;
+            ConnectOutcome::Lost { reason, graceful } => {
+                // A clean server close (module republish) is expected — log it
+                // quietly at info level. An unexpected drop is a warning.
+                if graceful {
+                    info!("WebSocket closed by server: {reason}");
+                } else {
+                    warn!("WebSocket connection lost: {reason}");
+                }
+                let _ = event_tx
+                    .send(WsEvent::Disconnected { reason, graceful })
+                    .await;
                 // If the consumer is gone, abort the retry loop too.
                 if event_tx.is_closed() {
                     return;
+                }
+                // A graceful close means the server bounced us on purpose
+                // (typically a republish); reconnect briskly from the initial
+                // delay rather than carrying over a long accumulated backoff.
+                if graceful {
+                    backoff = RECONNECT_INITIAL_DELAY;
                 }
                 let delay_ms = backoff.as_millis() as u64;
                 let _ = event_tx
@@ -375,7 +396,12 @@ async fn connect_subscription_once(
 
     let request = match build_ws_request(url.clone(), auth_token) {
         Ok(r) => r,
-        Err(e) => return ConnectOutcome::Lost(format!("Request build error: {e}")),
+        Err(e) => {
+            return ConnectOutcome::Lost {
+                reason: format!("Request build error: {e}"),
+                graceful: false,
+            };
+        }
     };
 
     let (ws_stream, _) = match connect_async_with_config(request, Some(ws_config()), false).await {
@@ -394,7 +420,10 @@ async fn connect_subscription_once(
                 }
             }
             error!("WebSocket connect failed: {e}");
-            return ConnectOutcome::Lost(format!("Connect error: {e}"));
+            return ConnectOutcome::Lost {
+                reason: format!("Connect error: {e}"),
+                graceful: false,
+            };
         }
     };
 
@@ -411,7 +440,10 @@ async fn connect_subscription_once(
         let msg = SubscribeEnvelope::new(queries, request_id);
         if let Ok(json) = serde_json::to_string(&msg) {
             if let Err(e) = sink.send(Message::Text(json.into())).await {
-                return ConnectOutcome::Lost(format!("Re-subscribe send error: {e}"));
+                return ConnectOutcome::Lost {
+                    reason: format!("Re-subscribe send error: {e}"),
+                    graceful: false,
+                };
             }
         }
     }
@@ -421,6 +453,23 @@ async fn connect_subscription_once(
             // Inbound frames from the server.
             msg = stream.next() => {
                 match msg {
+                    // A Close frame is the server shutting us down cleanly —
+                    // the normal path when a module is republished. Treat it as
+                    // a graceful loss and return immediately so we don't also
+                    // emit a second "stream ended" event when `next()` yields
+                    // `None` on the following iteration.
+                    Some(Ok(Message::Close(cf))) => {
+                        let reason = cf
+                            .as_ref()
+                            .map(|f| f.reason.to_string())
+                            .filter(|r| !r.is_empty())
+                            .unwrap_or_else(|| "module exited".to_string());
+                        info!("Server sent Close frame: {reason}");
+                        return ConnectOutcome::Lost {
+                            reason,
+                            graceful: true,
+                        };
+                    }
                     Some(Ok(frame)) => {
                         if let Some(event) = decode_subscription_frame(frame) {
                             if event_tx.send(event).await.is_err() {
@@ -439,10 +488,13 @@ async fn connect_subscription_once(
                         // iteration; transient frame errors are tolerated.
                     }
                     None => {
-                        info!("WebSocket stream closed by server");
-                        return ConnectOutcome::Lost(
-                            "Server closed the connection".to_string(),
-                        );
+                        // The stream ended without a Close frame — an abrupt
+                        // drop (TCP reset, server killed). Not graceful.
+                        info!("WebSocket stream ended without a Close frame");
+                        return ConnectOutcome::Lost {
+                            reason: "Connection dropped".to_string(),
+                            graceful: false,
+                        };
                     }
                 }
             }
@@ -462,7 +514,10 @@ async fn connect_subscription_once(
                         };
                         if let Err(e) = sink.send(Message::Text(json.into())).await {
                             error!("Failed to send Subscribe frame: {e}");
-                            return ConnectOutcome::Lost(format!("Send error: {e}"));
+                            return ConnectOutcome::Lost {
+                                reason: format!("Send error: {e}"),
+                                graceful: false,
+                            };
                         }
                     }
                     Some(WsCommand::Close) | None => {
@@ -473,6 +528,7 @@ async fn connect_subscription_once(
                         if event_tx
                             .send(WsEvent::Disconnected {
                                 reason: "Client requested close".to_string(),
+                                graceful: true,
                             })
                             .await
                             .is_err()
@@ -503,6 +559,7 @@ async fn log_follow_task(
             let _ = event_tx
                 .send(WsEvent::Disconnected {
                     reason: format!("Request build error: {e}"),
+                    graceful: false,
                 })
                 .await;
             return;
@@ -516,6 +573,7 @@ async fn log_follow_task(
             let _ = event_tx
                 .send(WsEvent::Disconnected {
                     reason: format!("Connect error: {e}"),
+                    graceful: false,
                 })
                 .await;
             return;
@@ -557,6 +615,7 @@ async fn log_follow_task(
                                 let _ = event_tx
                                     .send(WsEvent::Disconnected {
                                         reason: "Server closed log stream".to_string(),
+                                        graceful: true,
                                     })
                                     .await;
                                 break;
@@ -576,6 +635,7 @@ async fn log_follow_task(
                         let _ = event_tx
                             .send(WsEvent::Disconnected {
                                 reason: "Log stream ended".to_string(),
+                                graceful: false,
                             })
                             .await;
                         break;
@@ -590,6 +650,7 @@ async fn log_follow_task(
                         let _ = event_tx
                             .send(WsEvent::Disconnected {
                                 reason: "Client requested close".to_string(),
+                                graceful: true,
                             })
                             .await;
                         break;
@@ -630,11 +691,17 @@ fn decode_subscription_frame(frame: Message) -> Option<WsEvent> {
         }
         Message::Ping(_) | Message::Pong(_) => None,
         Message::Close(frame) => {
+            // Note: the subscription loop intercepts Close frames before
+            // calling this decoder (see `connect_subscription_once`), so this
+            // arm is effectively unreachable there. Kept for completeness.
             let reason = frame
                 .as_ref()
                 .map(|f| f.reason.to_string())
                 .unwrap_or_else(|| "no reason".to_string());
-            Some(WsEvent::Disconnected { reason })
+            Some(WsEvent::Disconnected {
+                reason,
+                graceful: true,
+            })
         }
         Message::Frame(_) => None,
     }
@@ -696,12 +763,15 @@ mod tests {
         // Sanity check that the discriminants don't accidentally
         // collapse — Fatal must round-trip through `matches!` so the
         // retry loop in subscription_task can reliably skip backoff.
-        let lost = ConnectOutcome::Lost("transient".to_string());
+        let lost = ConnectOutcome::Lost {
+            reason: "transient".to_string(),
+            graceful: false,
+        };
         let fatal = ConnectOutcome::Fatal("HTTP 500".to_string());
-        assert!(matches!(lost, ConnectOutcome::Lost(_)));
+        assert!(matches!(lost, ConnectOutcome::Lost { .. }));
         assert!(matches!(fatal, ConnectOutcome::Fatal(_)));
         assert!(!matches!(lost, ConnectOutcome::Fatal(_)));
-        assert!(!matches!(fatal, ConnectOutcome::Lost(_)));
+        assert!(!matches!(fatal, ConnectOutcome::Lost { .. }));
     }
 
     #[test]

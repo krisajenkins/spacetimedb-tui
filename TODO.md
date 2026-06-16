@@ -20,7 +20,7 @@ No matter what I pass, it just connects to maincloud.
 
 The official `spacetime` CLI tool supports a flag that lets you say `-slocal` or `-smaincloud` as a shortcut to the right host/port/tls setting. That's really helpful. Let's do that too.
 
-# [ ] Server closes connection-handling.
+# ☑ Server closes connection-handling.
 
 When you publish breaking changes on a spacetimedb database, it deliberately closes all clients and expects them to reconnect. That's normal behaviour we should handle gracefully, but instead the screen splats these messages randomly:
 

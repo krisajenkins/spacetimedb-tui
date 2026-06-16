@@ -3213,8 +3213,7 @@ impl App {
             WsEvent::LogLine(entry) => {
                 send_event(&self.event_tx, AppEvent::LogLine(entry));
             }
-            WsEvent::Disconnected { reason } => {
-                tracing::warn!("WebSocket disconnected: {reason}");
+            WsEvent::Disconnected { reason, graceful } => {
                 self.state.ws_connected = false;
                 // If the disconnect was flagged as permanent
                 // ("(retries disabled)" marker from subscription_task),
@@ -3224,10 +3223,20 @@ impl App {
                     self.state.ws_reconnect_deadline = None;
                     self.state.ws_reconnect_attempt = 0;
                 }
-                send_event(
-                    &self.event_tx,
-                    AppEvent::Notification(format!("WebSocket disconnected: {reason}")),
-                );
+                if graceful {
+                    // A clean server close — normally a module republish, which
+                    // deliberately drops all clients and expects them to
+                    // reconnect. This is routine, so log it quietly and let the
+                    // status bar's reconnect countdown be the only UI signal
+                    // rather than firing an alarming disconnect toast.
+                    tracing::info!("WebSocket closed by server: {reason}");
+                } else {
+                    tracing::warn!("WebSocket disconnected: {reason}");
+                    send_event(
+                        &self.event_tx,
+                        AppEvent::Notification(format!("WebSocket disconnected: {reason}")),
+                    );
+                }
             }
             WsEvent::Reconnecting { attempt, delay_ms } => {
                 tracing::info!("WebSocket reconnect attempt {attempt} in {delay_ms}ms");

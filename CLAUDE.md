@@ -52,3 +52,21 @@ spacetime list   # enumerate the identity's databases
   except Esc/Enter. It must therefore be rendered as a visible overlay
   (`ui/components/error.rs`), not just the truncated status-bar indicator —
   otherwise the UI looks frozen.
+
+## Logging
+
+- **Logs go to a file, never stderr while the TUI is up.** stderr shares the
+  terminal with the ratatui alternate screen, so any `tracing` line would
+  paint over the UI at random. `init_tracing` (in `main.rs`) writes to
+  `config_dir()/tui.log` (truncated per run, ANSI off); `--log-file` overrides
+  the path. The path is `eprintln!`'d once at startup, before the alternate
+  screen. Default level is `warn` (`RUST_LOG` overrides).
+
+- **A server-initiated Close is normal, not an error.** Republishing a module
+  drops all clients with a WebSocket Close frame (`reason: "module exited"`)
+  and expects them to reconnect. `connect_subscription_once` intercepts the
+  Close frame and returns `ConnectOutcome::Lost { graceful: true }` (an abrupt
+  drop — stream `None`/socket error — is `graceful: false`). The graceful path
+  logs at `info!`, resets the backoff so reconnection is brisk, and shows no
+  disconnect toast — the status-bar reconnect countdown is the only UI signal.
+  Only non-graceful losses `warn!` and raise a `Notification`.
