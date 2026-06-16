@@ -334,6 +334,16 @@ pub struct Cli {
     )]
     pub log_level: String,
 
+    /// File to write logs to. While the TUI owns the terminal, log output
+    /// can't go to stdout/stderr without painting over the interface, so it
+    /// is written here instead. Defaults to a per-user state directory.
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write logs to this file instead of the default location"
+    )]
+    pub log_file: Option<PathBuf>,
+
     /// Colour theme.
     #[arg(
         long,
@@ -530,6 +540,9 @@ pub struct Config {
     pub theme_name: ThemeName,
     /// Tracing log level string.
     pub log_level: String,
+    /// Optional explicit log file path (`--log-file`). When `None`, a
+    /// per-user state-directory default is used. Resolved in `main`.
+    pub log_file: Option<PathBuf>,
     /// User-level preferences from `~/.config/spacetimedb-tui/config.toml`.
     /// Used at runtime by `App::bootstrap` for session restore and by the
     /// theming layer to look up custom palettes.
@@ -618,6 +631,7 @@ impl Config {
             theme,
             theme_name,
             log_level: cli.log_level,
+            log_file: cli.log_file,
             user_config: user_cfg,
         })
     }
@@ -654,6 +668,7 @@ mod tests {
             token: None,
             tls,
             log_level: "warn".to_string(),
+            log_file: None,
             theme: ThemeName::Dark,
         }
     }

@@ -14,6 +14,7 @@ mod ui;
 mod user_config;
 
 use std::io;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -30,7 +31,14 @@ use crate::{api::SpacetimeClient, app::App, config::Config};
 
 fn main() -> Result<()> {
     let config = Config::parse().context("Failed to parse configuration")?;
-    init_tracing(&config.log_level);
+    // The TUI owns the terminal, so logs go to a file rather than stderr
+    // (which would paint over the interface). Announce the path before the
+    // alternate screen takes over so it's discoverable.
+    let log_path = resolve_log_path(&config);
+    init_tracing(&config.log_level, log_path.as_deref());
+    if let Some(path) = &log_path {
+        eprintln!("Logging to {}", path.display());
+    }
     install_panic_logger();
 
     info!(
@@ -99,14 +107,45 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
 
 // ── Tracing ───────────────────────────────────────────────────────────────────
 
-fn init_tracing(level: &str) {
+/// Resolve where logs should be written. An explicit `--log-file` wins;
+/// otherwise fall back to the app's per-user config directory (the same
+/// location used for `config.toml`/`session.toml`). Returns `None` only if
+/// no override was given *and* the platform config dir can't be determined,
+/// in which case logging is disabled rather than dumped onto the screen.
+fn resolve_log_path(config: &Config) -> Option<PathBuf> {
+    config
+        .log_file
+        .clone()
+        .or_else(|| user_config::config_dir().map(|d| d.join("tui.log")))
+}
+
+/// Initialise the `tracing` subscriber, writing to `path` if given. Falls
+/// back to stderr only when no log file could be opened — better to risk a
+/// little screen noise than to swallow logs entirely.
+fn init_tracing(level: &str, path: Option<&std::path::Path>) {
+    use std::sync::Mutex;
     use tracing_subscriber::{EnvFilter, fmt};
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+    let builder = fmt().with_env_filter(filter).with_target(false);
+
+    // Try to open the log file (creating its parent directory). A fresh file
+    // per run keeps the log scoped to the current session.
+    let file = path.and_then(|p| {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::File::create(p).ok()
+    });
+
+    match file {
+        // ANSI off: a log file should hold plain text, not colour escapes.
+        Some(file) => builder
+            .with_ansi(false)
+            .with_writer(Mutex::new(file))
+            .init(),
+        None => builder.with_writer(std::io::stderr).init(),
+    }
 }
 
 /// Route every panic (including ones that fire inside `tokio::spawn`
