@@ -177,8 +177,14 @@ fn render_info_bar(area: Rect, buf: &mut Buffer, app: &AppState) {
         ));
     }
     if let Some(tbl) = app.selected_table() {
+        // Views read as 👁 so it's clear the grid is a read-only view.
+        let name = if tbl.is_view {
+            format!("  ›  👁️ {}", tbl.table_name)
+        } else {
+            format!("  ›  {}", tbl.table_name)
+        };
         spans.push(Span::styled(
-            format!("  ›  {}", tbl.table_name),
+            name,
             Style::default().fg(fg_primary).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(

@@ -1391,7 +1391,15 @@ impl App {
                 .set_database_status(&name, crate::state::DatabaseStatus::Active);
             self.state.cache_schema(&name, schema.clone());
         }
-        self.state.tables = schema.tables.clone();
+        // Views share the table list so they're navigable and browsable; the
+        // `is_view` flag on each lets the sidebar/grid mark them and refuse
+        // writes. Tables first, then views, for a stable ordering.
+        self.state.tables = schema
+            .tables
+            .iter()
+            .chain(schema.views.iter())
+            .cloned()
+            .collect();
         // If we restored a session and the user was looking at
         // a specific table, jump to it instead of defaulting
         // to row 0.
@@ -1406,12 +1414,15 @@ impl App {
         // Session restore is one-shot — don't keep firing it
         // every time the user navigates to a new database.
         self.pending_session = None;
+        let table_count = schema.tables.len();
+        let view_count = schema.views.len();
         self.state.current_schema = Some(schema);
-        let table_count = self.state.tables.len();
-        send_event(
-            &self.event_tx,
-            AppEvent::Notification(format!("Schema loaded — {table_count} tables")),
-        );
+        let summary = if view_count > 0 {
+            format!("Schema loaded — {table_count} tables, {view_count} views")
+        } else {
+            format!("Schema loaded — {table_count} tables")
+        };
+        send_event(&self.event_tx, AppEvent::Notification(summary));
         // Selecting a database should show data, not an empty grid: load
         // the highlighted table's rows (from cache when possible).
         if self.state.selected_table_idx.is_some() {
@@ -1782,7 +1793,25 @@ impl App {
 
     /// Open spreadsheet edit mode on the Tables tab. No-op if the
     /// user hasn't loaded any table data yet (nothing to edit).
+    /// Refuse a write operation when the current selection is a view.
+    ///
+    /// Views are read-only server-defined queries, so cell edits, inserts,
+    /// updates, deletes, and truncates don't apply. Returns `true` (and shows
+    /// a notification) when the op should be aborted.
+    fn block_if_view(&mut self, op: &str) -> bool {
+        if self.state.selected_table().is_some_and(|t| t.is_view) {
+            self.state
+                .set_notification(format!("{op} unavailable — views are read-only"));
+            true
+        } else {
+            false
+        }
+    }
+
     fn enter_edit_mode(&mut self) {
+        if self.block_if_view("Editing") {
+            return;
+        }
         if self.state.table_browse_result.is_none() {
             self.state
                 .set_notification("Nothing to edit — load a table first".to_string());
@@ -2276,6 +2305,9 @@ impl App {
     /// rest are the editable column values. The submit handler builds
     /// an `UPDATE table SET col=val,... WHERE pk=original_pk` SQL.
     fn open_update_form(&mut self) {
+        if self.block_if_view("Editing") {
+            return;
+        }
         let Some(table) = self.state.selected_table().cloned() else {
             self.state.set_notification("No table selected".to_string());
             return;
@@ -2432,6 +2464,9 @@ impl App {
     /// safely offer from a TUI session — it issues `DELETE FROM
     /// <table>` once the user has typed the table name back to us.
     fn open_truncate_table_form(&mut self) {
+        if self.block_if_view("Delete") {
+            return;
+        }
         let Some(table) = self.state.selected_table().map(|t| t.table_name.clone()) else {
             self.state.set_notification("No table selected".to_string());
             return;
@@ -2447,6 +2482,9 @@ impl App {
     /// Open a confirm dialog to delete the currently selected row.
     /// Uses the heuristic in [`pick_primary_key`] for the WHERE clause.
     fn open_delete_confirm(&mut self) {
+        if self.block_if_view("Delete") {
+            return;
+        }
         // Pull the data we need before borrowing mutably.
         let Some(table) = self.state.selected_table().cloned() else {
             self.state.set_notification("No table selected".to_string());
@@ -2514,6 +2552,9 @@ impl App {
     /// submit handler builds an `INSERT INTO ... VALUES (...)` SQL
     /// statement and runs it via [`spawn_write_sql`].
     fn open_insert_form(&mut self) {
+        if self.block_if_view("Insert") {
+            return;
+        }
         let Some(table) = self.state.selected_table().cloned() else {
             self.state.set_notification("No table selected".to_string());
             return;
@@ -3878,6 +3919,7 @@ mod modal_helper_tests {
             primary_key_cols: vec![],
             indexes: vec![],
             constraints: vec![],
+            is_view: false,
         }
     }
 

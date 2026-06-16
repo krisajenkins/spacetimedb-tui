@@ -181,6 +181,16 @@ pub struct TableInfo {
     /// Raw constraint definitions.
     #[serde(default)]
     pub constraints: Vec<Value>,
+    /// Whether this entry is a **view** rather than a real table.
+    ///
+    /// Views are read-only, server-defined query results. They aren't in the
+    /// schema's `tables` list — they come from `misc_exports` (see
+    /// `client::parse_schema_response`) and are modelled as `TableInfo` with
+    /// this flag set so they can share the same navigation / data-browse path
+    /// (a view is SQL-queryable by name just like a table). Write operations
+    /// are refused for views.
+    #[serde(default)]
+    pub is_view: bool,
 }
 
 /// Metadata for a single column inside a `TableInfo`.
@@ -241,6 +251,13 @@ pub struct SchemaResponse {
     pub typespace: Value,
     /// All tables in the database.
     pub tables: Vec<TableInfo>,
+    /// All **views** exposed by the module (from `misc_exports`).
+    ///
+    /// Kept separate from [`Self::tables`] so the table list stays semantically
+    /// pure; the app merges the two into its navigable list. Each view is a
+    /// [`TableInfo`] with `is_view = true`.
+    #[serde(default)]
+    pub views: Vec<TableInfo>,
     /// All reducers exposed by the database module.
     pub reducers: Vec<ReducerInfo>,
 }

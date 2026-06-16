@@ -20,6 +20,7 @@ const FG_MUTED: Color = Color::Rgb(110, 110, 110);
 const FG_REDUCER: Color = Color::Rgb(229, 192, 123);
 const FG_TABLE: Color = Color::Rgb(97, 175, 239);
 const FG_SYSTEM: Color = Color::Rgb(86, 182, 194);
+const FG_VIEW: Color = Color::Rgb(198, 160, 246);
 const FG_PARAM: Color = Color::Rgb(180, 180, 180);
 const SELECTED_BG: Color = Color::Rgb(36, 52, 72);
 const SECTION_FG: Color = Color::Rgb(86, 182, 194);
@@ -189,7 +190,7 @@ fn render_tables_panel(area: Rect, buf: &mut Buffer, schema: &crate::api::types:
         return;
     }
 
-    if schema.tables.is_empty() {
+    if schema.tables.is_empty() && schema.views.is_empty() {
         let msg = Line::from(Span::styled("  (no tables)", Style::default().fg(FG_MUTED)));
         buf.set_line(inner.x, inner.y, &msg, inner.width);
         return;
@@ -267,6 +268,44 @@ fn render_tables_panel(area: Rect, buf: &mut Buffer, schema: &crate::api::types:
             buf.set_line(inner.x, inner.y + row as u16, &col_line, inner.width);
             row += 1;
         }
+    }
+
+    // Views section — read-only, server-defined queries from `misc_exports`.
+    if !schema.views.is_empty() && row < visible_h {
+        row += 1; // blank line
+        if row < visible_h {
+            let section_line = Line::from(Span::styled(
+                "  VIEWS",
+                Style::default()
+                    .fg(FG_VIEW)
+                    .add_modifier(Modifier::UNDERLINED),
+            ));
+            buf.set_line(inner.x, inner.y + row as u16, &section_line, inner.width);
+            row += 1;
+        }
+    }
+
+    for view in &schema.views {
+        if row >= visible_h {
+            break;
+        }
+        let access = if view.table_access == "private" {
+            "private"
+        } else {
+            "public"
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!("    👁️ {}", view.table_name),
+                Style::default().fg(FG_VIEW),
+            ),
+            Span::styled(
+                format!("  ({access}, {} cols)", view.columns.len()),
+                Style::default().fg(FG_MUTED),
+            ),
+        ]);
+        buf.set_line(inner.x, inner.y + row as u16, &line, inner.width);
+        row += 1;
     }
 
     // System tables section

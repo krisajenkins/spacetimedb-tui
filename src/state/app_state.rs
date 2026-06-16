@@ -1075,6 +1075,7 @@ mod tests {
         let schema = Schema {
             typespace: serde_json::Value::Null,
             tables: Vec::new(),
+            views: Vec::new(),
             reducers: Vec::new(),
         };
 

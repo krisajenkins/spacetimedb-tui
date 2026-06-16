@@ -250,15 +250,19 @@ fn build_items(app: &AppState) -> Vec<TreeItem> {
                     let branch = if is_last { "└──" } else { "├──" };
                     let is_selected_tbl = app.selected_table_idx == Some(ti);
                     let marker = if is_selected_tbl { "▸ " } else { "  " };
-                    // Reuse the module inspector's access glyphs so a private
-                    // table reads the same way in both views.
-                    let access_icon = if table.table_access == "private" {
+                    // Views get an eye glyph; real tables reuse the module
+                    // inspector's public/private glyphs so they read the same
+                    // way in both surfaces.
+                    let icon = if table.is_view {
+                        // VS16 (👁️, width 2) so it aligns with the width-2
+                        // 🔒/🌐 table glyphs; the bare eye is only 1 cell wide.
+                        "👁️"
+                    } else if table.table_access == "private" {
                         "🔒"
                     } else {
                         "🌐"
                     };
-                    let label =
-                        format!("      {branch} {marker}{access_icon} {}", table.table_name);
+                    let label = format!("      {branch} {marker}{icon} {}", table.table_name);
 
                     items.push(TreeItem {
                         label,
@@ -344,6 +348,7 @@ mod tests {
             primary_key_cols: Vec::new(),
             indexes: Vec::new(),
             constraints: Vec::new(),
+            is_view: false,
         };
 
         let mut app = AppState::new("http://localhost:3000");
@@ -368,5 +373,38 @@ mod tests {
         assert!(!public.label.contains('🔒'));
         assert!(private.label.contains('🔒'));
         assert!(!private.label.contains('🌐'));
+    }
+
+    #[test]
+    fn view_rows_use_the_eye_glyph_not_access_glyphs() {
+        use crate::api::types::TableInfo;
+
+        let view = TableInfo {
+            table_name: "my_boards".to_string(),
+            product_type_ref: 0,
+            table_type: "user".to_string(),
+            table_access: "public".to_string(),
+            columns: Vec::new(),
+            primary_key_cols: Vec::new(),
+            indexes: Vec::new(),
+            constraints: Vec::new(),
+            is_view: true,
+        };
+
+        let mut app = AppState::new("http://localhost:3000");
+        app.databases = vec![Database::new("db")];
+        app.selected_database_idx = Some(0);
+        app.tables = vec![view];
+
+        let items = build_items(&app);
+        let row = items
+            .iter()
+            .find(|i| i.label.contains("my_boards"))
+            .unwrap();
+
+        // A view reads as 👁, never the table public/private glyphs.
+        assert!(row.label.contains('👁'));
+        assert!(!row.label.contains('🌐'));
+        assert!(!row.label.contains('🔒'));
     }
 }

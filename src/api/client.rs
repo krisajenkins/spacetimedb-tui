@@ -902,8 +902,21 @@ fn parse_schema_response(raw: Value) -> Result<SchemaResponse> {
             primary_key_cols,
             indexes,
             constraints,
+            is_view: false,
         });
     }
+
+    // ── Views ──────────────────────────────────────────────────────────────
+    // Views live in `misc_exports`, not `tables`. Each entry looks like
+    // `{"View": {"name": "my_view", "is_public": true, "is_anonymous": false,
+    //   "params": {...}, "return_type": {"Array": {"Ref": N}}}}`. The `name`
+    // is the SQL-queryable name and `return_type.Array.Ref` indexes the
+    // typespace for the view's row type, so columns resolve just like tables.
+    let views = raw
+        .get("misc_exports")
+        .and_then(|m| m.as_array())
+        .map(|exports| parse_views(exports, &typespace_types))
+        .unwrap_or_default();
 
     // ── Reducers ───────────────────────────────────────────────────────────
     let reducers_raw = raw
@@ -925,8 +938,55 @@ fn parse_schema_response(raw: Value) -> Result<SchemaResponse> {
     Ok(SchemaResponse {
         typespace,
         tables,
+        views,
         reducers,
     })
+}
+
+/// Parse the `View` entries out of a schema's `misc_exports` array into
+/// `TableInfo`s with `is_view = true`.
+///
+/// `misc_exports` may also hold non-view exports in future server versions;
+/// anything without a `"View"` key is skipped. A view's columns are resolved
+/// from the typespace via `return_type.Array.Ref`, the same mechanism tables
+/// use, so the data grid and module inspector can show them identically.
+fn parse_views(exports: &[Value], typespace_types: &[Value]) -> Vec<crate::api::types::TableInfo> {
+    exports
+        .iter()
+        .filter_map(|export| {
+            let view = export.get("View")?;
+            let name = view.get("name").and_then(Value::as_str)?.to_string();
+
+            // return_type is `{"Array": {"Ref": N}}`; N indexes the typespace.
+            let type_ref = view
+                .get("return_type")
+                .and_then(|rt| rt.get("Array"))
+                .and_then(|arr| arr.get("Ref"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+
+            // Public/private mirrors a table's access so the same glyphs apply.
+            let is_public = view
+                .get("is_public")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let table_access = if is_public { "public" } else { "private" };
+
+            let columns = resolve_columns(typespace_types, type_ref as usize);
+
+            Some(crate::api::types::TableInfo {
+                table_name: name,
+                product_type_ref: type_ref,
+                table_type: "user".to_string(),
+                table_access: table_access.to_string(),
+                columns,
+                primary_key_cols: Vec::new(),
+                indexes: Vec::new(),
+                constraints: Vec::new(),
+                is_view: true,
+            })
+        })
+        .collect()
 }
 
 /// Extract the lowercase string key from a SpacetimeDB enum value.
@@ -1342,6 +1402,72 @@ mod tests {
         assert_eq!(schema.reducers[0].name, "set_status");
         assert_eq!(schema.reducers[0].params.len(), 1);
         assert_eq!(schema.reducers[0].params[0].name, "agent_id");
+    }
+
+    #[test]
+    fn test_parse_schema_response_extracts_views() {
+        // Views arrive in `misc_exports` (not `tables`), each as
+        // `{"View": {...}}` with a `return_type.Array.Ref` into the typespace.
+        let raw = json!({
+            "typespace": {
+                "types": [
+                    // 0: a real table's row type
+                    {"Product": {"elements": [
+                        {"name": {"some": "id"}, "algebraic_type": {"U64": []}}
+                    ]}},
+                    // 1: the view's row type
+                    {"Product": {"elements": [
+                        {"name": {"some": "board_id"}, "algebraic_type": {"U64": []}},
+                        {"name": {"some": "title"}, "algebraic_type": {"String": []}}
+                    ]}}
+                ]
+            },
+            "tables": [
+                {
+                    "name": "board",
+                    "product_type_ref": 0,
+                    "table_type": {"User": []},
+                    "table_access": {"Private": []}
+                }
+            ],
+            "reducers": [],
+            "misc_exports": [
+                {"View": {
+                    "name": "my_boards",
+                    "index": 0,
+                    "is_public": true,
+                    "is_anonymous": false,
+                    "params": {"elements": []},
+                    "return_type": {"Array": {"Ref": 1}}
+                }},
+                {"View": {
+                    "name": "secret_view",
+                    "index": 1,
+                    "is_public": false,
+                    "is_anonymous": false,
+                    "params": {"elements": []},
+                    "return_type": {"Array": {"Ref": 1}}
+                }}
+            ]
+        });
+
+        let schema = parse_schema_response(raw).unwrap();
+
+        // Real tables and views are kept in separate lists.
+        assert_eq!(schema.tables.len(), 1);
+        assert_eq!(schema.views.len(), 2);
+
+        let v0 = &schema.views[0];
+        assert_eq!(v0.table_name, "my_boards");
+        assert!(v0.is_view);
+        assert_eq!(v0.table_access, "public");
+        // Columns resolved from the typespace via return_type.Array.Ref.
+        assert_eq!(v0.columns.len(), 2);
+        assert_eq!(v0.columns[0].col_name, "board_id");
+        assert_eq!(v0.columns[1].col_name, "title");
+
+        // is_public:false maps to the private glyph.
+        assert_eq!(schema.views[1].table_access, "private");
     }
 
     #[test]
