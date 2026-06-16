@@ -114,6 +114,14 @@ pub struct App {
     /// In-memory copy of the last-known session state, applied to the
     /// UI once the database list arrives in `bootstrap`.
     pending_session: Option<crate::user_config::SessionState>,
+    /// The startup database to open, from `-d/--database` (or the user
+    /// config's `default_database`). Resolved **by name** against the real
+    /// database list once it arrives, rather than pre-inserted as a row — so
+    /// a name that doesn't exist surfaces a notification instead of a phantom
+    /// selection, and one that does exist is actually selected. One-shot:
+    /// taken on the first `DatabasesLoaded`, so a manual refresh won't re-fire
+    /// it. Takes priority over the session's `last_database` hint.
+    pending_database: Option<String>,
     /// SQL input state — single source of truth for the SQL editor buffer.
     pub sql_input: InputState,
     /// Table grid state for the tables tab.
@@ -186,6 +194,7 @@ impl App {
             } else {
                 None
             },
+            pending_database: config.database.clone(),
         }
     }
 
@@ -3397,25 +3406,37 @@ impl App {
                     self.state.selected_database_idx =
                         self.state.databases.iter().position(|d| d.name == name);
                 }
-                // If a previous session left a "last database" hint
-                // and we still have no selection, try to land on it.
-                if self.state.selected_database_idx.is_none() {
-                    if let Some(session) = self.pending_session.as_ref() {
-                        if let Some(ref last_db) = session.last_database {
-                            if let Some(idx) =
-                                self.state.databases.iter().position(|d| &d.name == last_db)
-                            {
-                                self.state.select_database(idx);
-                                if let Some(tab_idx) = session.last_tab {
-                                    self.state.current_tab = index_to_tab(tab_idx);
-                                }
-                                self.load_schema().await;
-                            }
+                // Decide the initial selection in priority order: an explicit
+                // `-d/--database` wins, then the session's last database, then
+                // the first in the list. `pending_database` is one-shot (taken
+                // here) so a later manual refresh won't keep yanking the cursor
+                // back, and a requested name that doesn't exist is reported
+                // rather than left selected as a phantom.
+                let session_last = self
+                    .pending_session
+                    .as_ref()
+                    .and_then(|s| s.last_database.clone());
+                let decision = decide_startup_selection(
+                    &self.state.databases,
+                    self.state.selected_database_idx,
+                    self.pending_database.take().as_deref(),
+                    session_last.as_deref(),
+                );
+                if let Some(missing) = decision.missing {
+                    self.state.set_notification(format!(
+                        "Database '{missing}' not found on this server — \
+                         showing the available databases instead"
+                    ));
+                }
+                if let Some(idx) = decision.select {
+                    self.state.select_database(idx);
+                    if decision.restore_session_tab {
+                        if let Some(tab_idx) =
+                            self.pending_session.as_ref().and_then(|s| s.last_tab)
+                        {
+                            self.state.current_tab = index_to_tab(tab_idx);
                         }
                     }
-                }
-                if !self.state.databases.is_empty() && self.state.selected_database_idx.is_none() {
-                    self.state.select_database(0);
                     self.load_schema().await;
                 }
             }
@@ -3627,6 +3648,69 @@ fn tab_to_index(tab: Tab) -> u8 {
 /// Inverse of [`tab_to_index`].
 fn index_to_tab(idx: u8) -> Tab {
     Tab::ALL.get(idx as usize).copied().unwrap_or(Tab::Tables)
+}
+
+/// The initial database selection to apply once the list loads.
+#[derive(Debug, Default, PartialEq)]
+struct StartupSelection {
+    /// Index to select, or `None` to leave the current selection untouched.
+    select: Option<usize>,
+    /// Whether to also restore the session's saved tab — true only when the
+    /// pick came from the session's `last_database` hint.
+    restore_session_tab: bool,
+    /// A requested `-d/--database` name that wasn't in the list, for a message.
+    missing: Option<String>,
+}
+
+/// Decide which database to auto-select after `DatabasesLoaded`, in priority
+/// order: an explicit `-d/--database` request, then the session's last
+/// database, then the first database. A requested name that isn't present is
+/// reported via [`StartupSelection::missing`] and otherwise treated as if it
+/// had not been given (so the user lands on a real database, not a phantom).
+///
+/// `current` is the selection already resolved by the name-preservation step
+/// (non-`None` on a manual refresh); without an explicit request it is kept.
+fn decide_startup_selection(
+    databases: &[crate::state::Database],
+    current: Option<usize>,
+    requested: Option<&str>,
+    session_last: Option<&str>,
+) -> StartupSelection {
+    let index_of = |name: &str| databases.iter().position(|d| d.name == name);
+
+    // An explicit `-d/--database` wins outright.
+    if let Some(want) = requested {
+        if let Some(idx) = index_of(want) {
+            return StartupSelection {
+                select: Some(idx),
+                ..Default::default()
+            };
+        }
+        // Requested but absent: fall back as if unrequested, but report it.
+        return StartupSelection {
+            missing: Some(want.to_string()),
+            ..decide_startup_selection(databases, current, None, session_last)
+        };
+    }
+
+    // An existing selection (e.g. preserved across a refresh) stays put.
+    if current.is_some() {
+        return StartupSelection::default();
+    }
+
+    // Session hint next, then simply the first database.
+    if let Some(idx) = session_last.and_then(index_of) {
+        return StartupSelection {
+            select: Some(idx),
+            restore_session_tab: true,
+            ..Default::default()
+        };
+    }
+
+    StartupSelection {
+        select: (!databases.is_empty()).then_some(0),
+        ..Default::default()
+    }
 }
 
 // ── Modal helpers (Faz 5) ────────────────────────────────────────────────────
@@ -4331,5 +4415,87 @@ pub fn draw_frame(
     // ── Command palette (always on top, even above modals) ──────────────
     if let Some(ref palette) = state.palette {
         render_palette(area, frame.buffer_mut(), palette);
+    }
+}
+
+// ── Startup database-selection tests ─────────────────────────────────────────
+#[cfg(test)]
+mod startup_selection_tests {
+    use super::*;
+    use crate::state::Database;
+
+    fn dbs(names: &[&str]) -> Vec<Database> {
+        names.iter().map(|n| Database::new(*n)).collect()
+    }
+
+    #[test]
+    fn explicit_database_that_exists_is_selected() {
+        // Regression: `-d <db>` for a real database must actually select it,
+        // regardless of the list's order (the bug: it didn't get selected).
+        let list = dbs(&["alpha", "beta", "gamma"]);
+        let d = decide_startup_selection(&list, None, Some("gamma"), None);
+        assert_eq!(d.select, Some(2));
+        assert!(d.missing.is_none());
+        assert!(!d.restore_session_tab);
+    }
+
+    #[test]
+    fn explicit_database_that_is_missing_is_reported_and_falls_back() {
+        // Regression: `-d <db>` for a non-existent database must NOT become a
+        // phantom selection. Instead report it and fall back to the first db.
+        let list = dbs(&["alpha", "beta"]);
+        let d = decide_startup_selection(&list, None, Some("nope"), None);
+        assert_eq!(d.missing.as_deref(), Some("nope"));
+        assert_eq!(d.select, Some(0)); // fell back to the first real database
+    }
+
+    #[test]
+    fn explicit_database_beats_session_hint() {
+        // Priority: an explicit -d wins over the session's last database.
+        let list = dbs(&["alpha", "beta", "gamma"]);
+        let d = decide_startup_selection(&list, None, Some("beta"), Some("gamma"));
+        assert_eq!(d.select, Some(1));
+        assert!(!d.restore_session_tab); // explicit pick, not the session path
+    }
+
+    #[test]
+    fn missing_explicit_database_still_falls_back_to_session_hint() {
+        let list = dbs(&["alpha", "beta", "gamma"]);
+        let d = decide_startup_selection(&list, None, Some("nope"), Some("gamma"));
+        assert_eq!(d.missing.as_deref(), Some("nope"));
+        assert_eq!(d.select, Some(2)); // session hint
+        assert!(d.restore_session_tab);
+    }
+
+    #[test]
+    fn session_hint_used_when_no_explicit_request() {
+        let list = dbs(&["alpha", "beta"]);
+        let d = decide_startup_selection(&list, None, None, Some("beta"));
+        assert_eq!(d.select, Some(1));
+        assert!(d.restore_session_tab);
+    }
+
+    #[test]
+    fn falls_back_to_first_database_with_no_hints() {
+        let list = dbs(&["alpha", "beta"]);
+        let d = decide_startup_selection(&list, None, None, None);
+        assert_eq!(d.select, Some(0));
+        assert!(!d.restore_session_tab);
+    }
+
+    #[test]
+    fn existing_selection_is_kept_on_refresh() {
+        // On a manual refresh `current` is Some and there's no pending request;
+        // the selection must be left untouched (no reselect / schema reload).
+        let list = dbs(&["alpha", "beta"]);
+        let d = decide_startup_selection(&list, Some(1), None, Some("alpha"));
+        assert_eq!(d.select, None);
+        assert!(d.missing.is_none());
+    }
+
+    #[test]
+    fn empty_database_list_selects_nothing() {
+        let d = decide_startup_selection(&[], None, None, None);
+        assert_eq!(d.select, None);
     }
 }

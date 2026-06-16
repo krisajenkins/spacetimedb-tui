@@ -20,11 +20,18 @@ No matter what I pass, it just connects to maincloud.
 
 The official `spacetime` CLI tool supports a flag that lets you say `-slocal` or `-smaincloud` as a shortcut to the right host/port/tls setting. That's really helpful. Let's do that too.
 
+# [ ] Server closes connection-handling.
+
+When you publish breaking changes on a spacetimedb database, it deliberately closes all clients and expects them to reconnect. That's normal behaviour we should handle gracefully, but instead the screen splats these messages randomly:
+
+`WARN WebSocket disconnected: module exited`
+`WARN WebSocket disconnected: Server closed the connection`
+
 # ☑ We should show views
 
 Both in the table browser, and the module browser. Shown with an 👁️ icon?
 
-# [ ] `-d/--database` doesn't work very well.
+# ☑ `-d/--database` doesn't work very well.
 
 If the supplied database doesn't exist, it shows up as the selection in the GUI, but the first data load obviously fails.
 If it _does_ exist it doesn't get selected, so the flag was pointless.

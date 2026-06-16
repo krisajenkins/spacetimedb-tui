@@ -225,6 +225,11 @@ pub struct Database {
 
 impl Database {
     /// A database with not-yet-probed status.
+    ///
+    /// Used by tests; the live code builds `Database` directly in the
+    /// `DatabasesLoaded` handler so it can carry over a previously probed
+    /// status.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),

@@ -54,16 +54,11 @@ async fn async_main(config: Config) -> Result<()> {
     let client = SpacetimeClient::new(config.server_url.clone(), config.auth_token.clone())
         .context("Failed to create SpacetimeDB HTTP client")?;
 
-    // Build the application.
+    // Build the application. The startup database (`-d/--database`) is held in
+    // `App::pending_database` and resolved by name once the real database list
+    // arrives — see the `DatabasesLoaded` handler — rather than pre-selected
+    // here, so a non-existent name can't become a phantom selection.
     let mut app = App::new(&config, client);
-
-    // Pre-select the database from the CLI flag if provided.
-    if let Some(db) = &config.database {
-        app.state
-            .databases
-            .push(crate::state::Database::new(db.clone()));
-        app.state.select_database(0);
-    }
 
     // Set up the terminal.
     let mut terminal = setup_terminal().context("Failed to set up terminal")?;
